@@ -1,0 +1,378 @@
+import shutil
+from pathlib import Path
+
+import gmsh
+import numpy as np
+import adios4dolfinx
+
+from mpi4py import MPI
+from dolfinx.io import XDMFFile, gmsh as gmshio
+from dolfinx.mesh import GhostMode, create_cell_partitioner
+
+
+# =============================================================================
+# MPI configuration
+# =============================================================================
+
+comm = MPI.COMM_WORLD
+model_rank = 0
+gdim = 2
+
+
+# =============================================================================
+# Output paths
+# =============================================================================
+
+MESH_DIR = Path("mesh")
+MESH_XDMF = MESH_DIR / "mesh.xdmf"
+TAGS_XDMF = MESH_DIR / "facet_tags.xdmf"
+MESH_BP = MESH_DIR / "mesh.bp"
+MESH_MSH = MESH_DIR / "mesh.msh"
+
+if comm.rank == 0:
+    MESH_DIR.mkdir(parents=True, exist_ok=True)
+
+comm.barrier()
+
+
+# =============================================================================
+# Hill and domain parameters
+# =============================================================================
+
+H_HILL = 0.117
+A_HILL = 3.0 * H_HILL
+
+N_HILL = H_HILL / A_HILL
+M_HILL = N_HILL + np.sqrt(N_HILL**2 + 1.0)
+
+X_MIN = -10.0 * H_HILL
+X_MAX = 20.0 * H_HILL
+Z_MIN = 0.0
+Z_MAX = 8.55 * H_HILL
+
+
+# =============================================================================
+# Physical markers
+# =============================================================================
+
+FLUID_MARKER = 1
+INLET_MARKER = 2
+OUTLET_MARKER = 3
+BOTTOM_MARKER = 4
+TOP_MARKER = 5
+HILL_MARKER = 6
+
+
+# =============================================================================
+# Geometry definition
+# =============================================================================
+
+def hill_coordinates(num_pts=101):
+    """Return the RUSHIL H8 hill profile coordinates."""
+
+    xi = np.linspace(-A_HILL, A_HILL, num_pts)
+    denominator = xi**2 + M_HILL**2 * (A_HILL**2 - xi**2)
+
+    x = 0.5 * xi * (1.0 + A_HILL**2 / denominator)
+    z = (
+        0.5
+        * M_HILL
+        * np.sqrt(np.maximum(A_HILL**2 - xi**2, 0.0))
+        * (1.0 - A_HILL**2 / denominator)
+    )
+
+    return x, z
+
+
+def initialize_gmsh():
+    """Initialize Gmsh with deterministic meshing options."""
+
+    gmsh.initialize()
+
+    gmsh.option.setNumber("General.NumThreads", 1)
+    gmsh.option.setNumber("Mesh.RandomFactor", 0)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+
+
+def classify_boundary_curves(volume, x_hill):
+    """Classify boundary curves according to their geometric position."""
+
+    inflow = []
+    outflow = []
+    bottom_walls = []
+    top_wall = []
+    hill_curves = []
+
+    boundaries = gmsh.model.getBoundary(volume, oriented=False)
+
+    for boundary in boundaries:
+        center = gmsh.model.occ.getCenterOfMass(boundary[0], boundary[1])
+        cx, cz = center[0], center[1]
+
+        if np.isclose(cx, X_MIN, atol=1e-6 * H_HILL):
+            inflow.append(boundary[1])
+
+        elif np.isclose(cx, X_MAX, atol=1e-6 * H_HILL):
+            outflow.append(boundary[1])
+
+        elif np.isclose(cz, Z_MAX, atol=1e-6 * H_HILL):
+            top_wall.append(boundary[1])
+
+        elif np.isclose(cz, Z_MIN, atol=1e-6 * H_HILL) and (
+            cx < float(x_hill[0]) - 1e-6 * H_HILL
+            or cx > float(x_hill[-1]) + 1e-6 * H_HILL
+        ):
+            bottom_walls.append(boundary[1])
+
+        else:
+            hill_curves.append(boundary[1])
+
+    return inflow, outflow, bottom_walls, top_wall, hill_curves
+
+
+def add_physical_groups(volume, inflow, outflow, bottom_walls, top_wall, hill_curves):
+    """Assign physical groups to the fluid domain and its boundaries."""
+
+    gmsh.model.addPhysicalGroup(volume[0][0], [volume[0][1]], FLUID_MARKER)
+    gmsh.model.setPhysicalName(volume[0][0], FLUID_MARKER, "Fluid")
+
+    gmsh.model.addPhysicalGroup(1, inflow, INLET_MARKER)
+    gmsh.model.setPhysicalName(1, INLET_MARKER, "Inlet")
+
+    gmsh.model.addPhysicalGroup(1, outflow, OUTLET_MARKER)
+    gmsh.model.setPhysicalName(1, OUTLET_MARKER, "Outlet")
+
+    gmsh.model.addPhysicalGroup(1, bottom_walls + hill_curves, BOTTOM_MARKER)
+    gmsh.model.setPhysicalName(1, BOTTOM_MARKER, "Bottom")
+
+    gmsh.model.addPhysicalGroup(1, top_wall, TOP_MARKER)
+    gmsh.model.setPhysicalName(1, TOP_MARKER, "Top")
+
+    gmsh.model.addPhysicalGroup(1, hill_curves, HILL_MARKER)
+    gmsh.model.setPhysicalName(1, HILL_MARKER, "Hill")
+
+
+def set_mesh_size_fields(bottom_walls, hill_curves):
+    """Apply distance-based refinement near the ground and hill surface."""
+
+    lc_hill = H_HILL / 18.0
+    lc_far = H_HILL / 2.0
+
+    wall_curves = hill_curves + bottom_walls
+
+    distance_field = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", wall_curves)
+    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", 120)
+
+    threshold_field = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_hill)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_far)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", 0.03 * H_HILL)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", 1.20 * H_HILL)
+
+    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+
+    return lc_hill, lc_far
+
+
+def build_gmsh_model():
+    """Build and mesh the two-dimensional isolated hill domain."""
+
+    gmsh.model.add("rushil_h8_hill")
+
+    rectangle = gmsh.model.occ.addRectangle(
+        X_MIN,
+        Z_MIN,
+        0.0,
+        X_MAX - X_MIN,
+        Z_MAX - Z_MIN,
+    )
+
+    x_hill, z_hill = hill_coordinates(num_pts=101)
+
+    p_left = gmsh.model.occ.addPoint(float(x_hill[0]), 0.0, 0.0)
+    p_right = gmsh.model.occ.addPoint(float(x_hill[-1]), 0.0, 0.0)
+
+    hill_points = [
+        gmsh.model.occ.addPoint(float(xx), float(zz), 0.0)
+        for xx, zz in zip(x_hill[1:-1], z_hill[1:-1])
+    ]
+
+    hill_spline = gmsh.model.occ.addSpline([p_left] + hill_points + [p_right])
+    hill_base = gmsh.model.occ.addLine(p_right, p_left)
+
+    hill_loop = gmsh.model.occ.addCurveLoop([hill_spline, hill_base])
+    hill_surface = gmsh.model.occ.addPlaneSurface([hill_loop])
+
+    gmsh.model.occ.cut([(gdim, rectangle)], [(gdim, hill_surface)])
+    gmsh.model.occ.synchronize()
+
+    volumes = gmsh.model.getEntities(dim=gdim)
+
+    if len(volumes) != 1:
+        raise RuntimeError(f"Expected one fluid domain, found {len(volumes)}.")
+
+    inflow, outflow, bottom_walls, top_wall, hill_curves = classify_boundary_curves(
+        volumes,
+        x_hill,
+    )
+
+    add_physical_groups(
+        volumes,
+        inflow,
+        outflow,
+        bottom_walls,
+        top_wall,
+        hill_curves,
+    )
+
+    lc_hill, lc_far = set_mesh_size_fields(bottom_walls, hill_curves)
+
+    gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.RecombineAll", 0)
+
+    gmsh.model.mesh.generate(gdim)
+    gmsh.model.mesh.setOrder(1)
+    gmsh.model.mesh.optimize("Netgen")
+
+    gmsh.write(str(MESH_MSH))
+
+    print_mesh_summary(
+        lc_hill,
+        lc_far,
+        inflow,
+        outflow,
+        bottom_walls,
+        top_wall,
+        hill_curves,
+    )
+
+
+def print_mesh_summary(
+    lc_hill,
+    lc_far,
+    inflow,
+    outflow,
+    bottom_walls,
+    top_wall,
+    hill_curves,
+):
+    """Print the geometry and mesh parameters."""
+
+    print(f"H_hill  = {H_HILL}")
+    print(f"a       = {A_HILL}")
+    print(f"n       = {N_HILL}")
+    print(f"m       = {M_HILL}")
+    print(f"x range = [{X_MIN}, {X_MAX}]")
+    print(f"z range = [{Z_MIN}, {Z_MAX}]")
+    print(f"lc_hill = {lc_hill}")
+    print(f"lc_far  = {lc_far}")
+    print(f"Inlet curves:  {inflow}")
+    print(f"Outlet curves: {outflow}")
+    print(f"Bottom curves: {bottom_walls}")
+    print(f"Top curves:    {top_wall}")
+    print(f"Hill curves:   {hill_curves}")
+
+
+# =============================================================================
+# Mesh conversion and output
+# =============================================================================
+
+def convert_to_dolfinx_mesh():
+    """Convert the Gmsh model into a DOLFINx mesh with physical tags."""
+
+    partitioner = create_cell_partitioner(GhostMode.none)
+
+    mesh_data = gmshio.model_to_mesh(
+        gmsh.model,
+        comm,
+        model_rank,
+        gdim=gdim,
+        partitioner=partitioner,
+    )
+
+    mesh = mesh_data.mesh
+    facet_tags = mesh_data.facet_tags
+    cell_tags = getattr(mesh_data, "cell_tags", None)
+
+    if facet_tags is None:
+        raise RuntimeError("Facet tags were not generated.")
+
+    facet_tags.name = "facet_tags"
+
+    if cell_tags is not None:
+        cell_tags.name = "cell_tags"
+
+    mesh.topology.create_entities(1)
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+
+    return mesh, facet_tags, cell_tags
+
+
+def write_xdmf_outputs(mesh, facet_tags):
+    """Write the mesh and facet tags in XDMF format."""
+
+    with XDMFFile(comm, MESH_XDMF, "w") as xdmf:
+        xdmf.write_mesh(mesh)
+
+    with XDMFFile(comm, TAGS_XDMF, "w") as xdmf:
+        xdmf.write_mesh(mesh)
+        xdmf.write_meshtags(facet_tags, mesh.geometry)
+
+
+def write_adios_outputs(mesh, facet_tags, cell_tags):
+    """Write the mesh and tags in ADIOS2 BP4 format."""
+
+    if comm.rank == 0 and MESH_BP.exists():
+        shutil.rmtree(MESH_BP)
+
+    comm.barrier()
+
+    adios4dolfinx.write_mesh(MESH_BP, mesh, engine="BP4")
+    adios4dolfinx.write_meshtags(
+        MESH_BP,
+        mesh,
+        facet_tags,
+        meshtag_name="facet_tags",
+        engine="BP4",
+    )
+
+    if cell_tags is not None:
+        adios4dolfinx.write_meshtags(
+            MESH_BP,
+            mesh,
+            cell_tags,
+            meshtag_name="cell_tags",
+            engine="BP4",
+        )
+
+
+def print_output_summary():
+    """Print the generated output files."""
+
+    if comm.rank == 0:
+        print(f"Saved XDMF mesh to:       {MESH_XDMF}")
+        print(f"Saved facet tags to:      {TAGS_XDMF}")
+        print(f"Saved ADIOS mesh+tags to: {MESH_BP}")
+        print(f"Saved raw Gmsh mesh to:   {MESH_MSH}")
+
+
+# =============================================================================
+# Main execution
+# =============================================================================
+
+if __name__ == "__main__":
+
+    initialize_gmsh()
+
+    if comm.rank == model_rank:
+        build_gmsh_model()
+
+    mesh, facet_tags, cell_tags = convert_to_dolfinx_mesh()
+
+    gmsh.finalize()
+
+    write_xdmf_outputs(mesh, facet_tags)
+    write_adios_outputs(mesh, facet_tags, cell_tags)
+    print_output_summary()
