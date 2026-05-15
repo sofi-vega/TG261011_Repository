@@ -1,0 +1,603 @@
+from pathlib import Path
+import json
+import shutil
+
+import gmsh
+import numpy as np
+from mpi4py import MPI
+
+from dolfinx.io import XDMFFile, gmsh as gmshio
+from dolfinx.mesh import GhostMode, create_cell_partitioner
+from dolfinx import mesh as dmesh
+
+import adios4dolfinx
+
+
+# =============================================================================
+# MPI SETTINGS
+# =============================================================================
+
+comm = MPI.COMM_WORLD
+model_rank = 0
+gdim = 2
+
+
+# =============================================================================
+# MAIN CONFIGURATION
+# =============================================================================
+
+POSSIBLE_CASE_DIRS = [
+    Path("portable_mesh_case"),
+    Path("Copernicus_DEM_Results") / "portable_mesh_case",
+]
+
+OUTPUT_DIRNAME = "mesh"
+
+MESH_ORDER = 1
+GENERATE_GMSH_GUI = False
+
+# The actuator disk is not introduced as a geometric obstacle.
+# It is identified after mesh generation as an internal cell-tagged region.
+TAG_ACTUATOR_DISK = True
+
+
+# =============================================================================
+# MESH RESOLUTION CONTROLS
+# =============================================================================
+
+COARSEN_FACTOR = 4
+REFINEMENT_DISTANCE_FACTOR = 0.4
+GROUND_DISTANCE_SAMPLING = 150
+
+
+# =============================================================================
+# PHYSICAL MARKERS
+# =============================================================================
+
+# Cell markers
+fluid_cell_marker = 1
+actuator_disk_cell_marker = 2
+
+# Facet markers
+inlet_marker = 2
+outlet_marker = 3
+bottom_marker = 4
+top_marker = 5
+
+
+# =============================================================================
+# INPUT DATA FUNCTIONS
+# =============================================================================
+
+def find_case_dir():
+    """Return the first available directory containing the portable case data."""
+
+    for case_dir in POSSIBLE_CASE_DIRS:
+        if case_dir.exists():
+            return case_dir
+
+    raise FileNotFoundError(
+        "The portable_mesh_case directory was not found.\n\n"
+        "Place it in one of the following locations:\n"
+        "  - portable_mesh_case/\n"
+        "  - Copernicus_DEM_Results/portable_mesh_case/"
+    )
+
+
+def load_case_data(case_dir):
+    """Load the terrain profile and mesh configuration from the portable case."""
+
+    profile_path = case_dir / "terrain_profile.npz"
+    config_path = case_dir / "mesh_config.json"
+
+    if not profile_path.exists():
+        raise FileNotFoundError(
+            f"The following file was not found:\n  {profile_path.resolve()}"
+        )
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"The following file was not found:\n  {config_path.resolve()}"
+        )
+
+    profile = np.load(profile_path)
+
+    if "terrain_x_m" not in profile or "terrain_z_m" not in profile:
+        raise RuntimeError(
+            "The terrain_profile.npz file must contain:\n"
+            "  - terrain_x_m\n"
+            "  - terrain_z_m"
+        )
+
+    terrain_x_m = np.asarray(profile["terrain_x_m"], dtype=float)
+    terrain_z_m = np.asarray(profile["terrain_z_m"], dtype=float)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    return terrain_x_m, terrain_z_m, cfg
+
+
+def clean_profile(x, z):
+    """Sort, validate, and shift the terrain profile so that the domain starts at x = 0."""
+
+    x = np.asarray(x, dtype=float)
+    z = np.asarray(z, dtype=float)
+
+    if x.size != z.size:
+        raise RuntimeError(
+            f"The terrain profile arrays have different sizes: x={x.size}, z={z.size}"
+        )
+
+    if x.size < 2:
+        raise RuntimeError("The terrain profile must contain at least two points.")
+
+    if not np.all(np.isfinite(x)) or not np.all(np.isfinite(z)):
+        raise RuntimeError("The terrain profile contains NaN or infinite values.")
+
+    idx = np.argsort(x)
+    x = x[idx]
+    z = z[idx]
+
+    x_unique, unique_idx = np.unique(x, return_index=True)
+    z_unique = z[unique_idx]
+
+    x_unique = x_unique - x_unique.min()
+
+    return x_unique, z_unique
+
+
+# =============================================================================
+# MESH GENERATION
+# =============================================================================
+
+def build_mesh_from_portable_data(terrain_x_m, terrain_z_m, cfg, mesh_dir):
+    """Generate the Gmsh terrain mesh and define the external boundary markers."""
+
+    terrain_x_m, terrain_z_m = clean_profile(terrain_x_m, terrain_z_m)
+
+    D_m = float(cfg["D_m"])
+    height_D = float(cfg["height_D"])
+    upstream_D = float(cfg.get("upstream_D", 0.0))
+
+    hub_height_m = float(cfg.get("hub_height_m", 0.0))
+    obs_w_m = float(cfg.get("obs_w_m", 0.0))
+    obs_h_m = float(cfg.get("obs_h_m", 0.0))
+
+    lc_global_m = COARSEN_FACTOR * float(cfg["lc_global_m"])
+    lc_ground_min_m = 1.5 * float(cfg["lc_ground_min_m"])
+    lc_top_min_m = COARSEN_FACTOR * float(
+        cfg.get("lc_top_min_m", cfg["lc_global_m"])
+    )
+
+    turbine_x_local_m = float(
+        cfg.get("turbine_x_local_m", upstream_D * D_m)
+    )
+
+    dist_ground_max_m = REFINEMENT_DISTANCE_FACTOR * float(
+        cfg.get("dist_ground_max_m", 5.0 * D_m)
+    )
+
+    x_left = float(terrain_x_m.min())
+    x_right = float(terrain_x_m.max())
+
+    z_terrain_min = float(terrain_z_m.min())
+    z_terrain_max = float(terrain_z_m.max())
+
+    domain_height_m = 300.0
+    z_top = z_terrain_max + domain_height_m
+
+    mesh_msh = mesh_dir / "mesh.msh"
+
+    # -------------------------------------------------------------------------
+    # Actuator-disk bounds
+    # -------------------------------------------------------------------------
+    # The actuator disk is only used to define an internal tagged region.
+    # It is not subtracted from the fluid domain.
+    # -------------------------------------------------------------------------
+
+    disk_info = None
+
+    if TAG_ACTUATOR_DISK:
+        ground_at_turbine_m = float(
+            np.interp(turbine_x_local_m, terrain_x_m, terrain_z_m)
+        )
+
+        obs_center_x_m = turbine_x_local_m
+        obs_center_y_m = ground_at_turbine_m + hub_height_m
+
+        obs_x0 = obs_center_x_m - obs_w_m / 2.0
+        obs_x1 = obs_center_x_m + obs_w_m / 2.0
+        obs_y0 = obs_center_y_m - obs_h_m / 2.0
+        obs_y1 = obs_center_y_m + obs_h_m / 2.0
+
+        if obs_x0 <= x_left or obs_x1 >= x_right:
+            raise RuntimeError(
+                "The actuator disk is outside the horizontal domain.\n"
+                f"Domain x-range: [{x_left:.6f}, {x_right:.6f}] m\n"
+                f"Actuator disk x-range: [{obs_x0:.6f}, {obs_x1:.6f}] m"
+            )
+
+        if obs_y1 >= z_top:
+            raise RuntimeError(
+                "The actuator disk touches or crosses the top boundary.\n"
+                f"Top boundary: {z_top:.6f} m\n"
+                f"Actuator disk upper edge: {obs_y1:.6f} m"
+            )
+
+        if obs_y0 <= ground_at_turbine_m:
+            print(
+                "\n[WARNING] The lower edge of the actuator disk is at or below "
+                "the terrain at the turbine location."
+            )
+            print("          Check hub_height_m and obs_h_m.")
+
+        disk_info = {
+            "obs_center_x_m": float(obs_center_x_m),
+            "obs_center_y_m": float(obs_center_y_m),
+            "obs_w_m": float(obs_w_m),
+            "obs_h_m": float(obs_h_m),
+            "obs_x0": float(obs_x0),
+            "obs_x1": float(obs_x1),
+            "obs_y0": float(obs_y0),
+            "obs_y1": float(obs_y1),
+        }
+
+    print("\nCase summary:")
+    print(f"  Number of terrain points: {terrain_x_m.size}")
+    print(f"  Domain x-range: {x_left:.6f} m to {x_right:.6f} m")
+    print(f"  Terrain z-range: {z_terrain_min:.6f} m to {z_terrain_max:.6f} m")
+    print(f"  Top boundary z: {z_top:.6f} m")
+    print(f"  COARSEN_FACTOR: {COARSEN_FACTOR}")
+    print(f"  REFINEMENT_DISTANCE_FACTOR: {REFINEMENT_DISTANCE_FACTOR}")
+    print(f"  lc_global_m used: {lc_global_m:.6f} m")
+    print(f"  lc_ground_min_m used: {lc_ground_min_m:.6f} m")
+    print(f"  lc_top_min_m used: {lc_top_min_m:.6f} m")
+    print(f"  dist_ground_max_m used: {dist_ground_max_m:.6f} m")
+
+    if TAG_ACTUATOR_DISK and disk_info is not None:
+        print("\nInternal actuator disk:")
+        print("  Note: this region is cell-tagged, not removed from the fluid domain.")
+        print(f"  Center x: {disk_info['obs_center_x_m']:.6f} m")
+        print(f"  Center y: {disk_info['obs_center_y_m']:.6f} m")
+        print(f"  Width:    {disk_info['obs_w_m']:.6f} m")
+        print(f"  Height:   {disk_info['obs_h_m']:.6f} m")
+        print(f"  x-range:  [{disk_info['obs_x0']:.6f}, {disk_info['obs_x1']:.6f}] m")
+        print(f"  y-range:  [{disk_info['obs_y0']:.6f}, {disk_info['obs_y1']:.6f}] m")
+
+    gmsh.model.add("terrain_mesh_with_internal_actuator_disk")
+
+    geo = gmsh.model.geo
+
+    # -------------------------------------------------------------------------
+    # Terrain and top-boundary points
+    # -------------------------------------------------------------------------
+
+    terrain_points = []
+    for x, z in zip(terrain_x_m, terrain_z_m):
+        p = geo.addPoint(float(x), float(z), 0.0, lc_ground_min_m)
+        terrain_points.append(p)
+
+    p_top_right = geo.addPoint(x_right, z_top, 0.0, lc_top_min_m)
+    p_top_left = geo.addPoint(x_left, z_top, 0.0, lc_top_min_m)
+
+    # -------------------------------------------------------------------------
+    # External boundary
+    # -------------------------------------------------------------------------
+
+    bottom_curve = geo.addPolyline(terrain_points)
+    right_curve = geo.addLine(terrain_points[-1], p_top_right)
+    top_curve = geo.addLine(p_top_right, p_top_left)
+    left_curve = geo.addLine(p_top_left, terrain_points[0])
+
+    outer_loop = geo.addCurveLoop([
+        bottom_curve,
+        right_curve,
+        top_curve,
+        left_curve,
+    ])
+
+    # -------------------------------------------------------------------------
+    # Fluid surface
+    # -------------------------------------------------------------------------
+    # The entire domain remains fluid. The actuator disk is marked later using
+    # cell midpoints.
+    # -------------------------------------------------------------------------
+
+    fluid_surface = geo.addPlaneSurface([outer_loop])
+
+    geo.synchronize()
+
+    # -------------------------------------------------------------------------
+    # Physical groups
+    # -------------------------------------------------------------------------
+
+    gmsh.model.addPhysicalGroup(2, [fluid_surface], fluid_cell_marker)
+    gmsh.model.setPhysicalName(2, fluid_cell_marker, "Fluid")
+
+    gmsh.model.addPhysicalGroup(1, [left_curve], inlet_marker)
+    gmsh.model.setPhysicalName(1, inlet_marker, "Inlet")
+
+    gmsh.model.addPhysicalGroup(1, [right_curve], outlet_marker)
+    gmsh.model.setPhysicalName(1, outlet_marker, "Outlet")
+
+    gmsh.model.addPhysicalGroup(1, [bottom_curve], bottom_marker)
+    gmsh.model.setPhysicalName(1, bottom_marker, "Bottom")
+
+    gmsh.model.addPhysicalGroup(1, [top_curve], top_marker)
+    gmsh.model.setPhysicalName(1, top_marker, "Top")
+
+    # -------------------------------------------------------------------------
+    # Ground refinement field
+    # -------------------------------------------------------------------------
+    # The mesh is refined near the terrain profile and gradually coarsened away
+    # from the ground. No additional geometric refinement is imposed around the
+    # actuator disk in this approach.
+    # -------------------------------------------------------------------------
+
+    distance_ground = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(
+        distance_ground,
+        "CurvesList",
+        [bottom_curve],
+    )
+    gmsh.model.mesh.field.setNumber(
+        distance_ground,
+        "Sampling",
+        GROUND_DISTANCE_SAMPLING,
+    )
+
+    threshold_ground = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(threshold_ground, "InField", distance_ground)
+    gmsh.model.mesh.field.setNumber(threshold_ground, "SizeMin", lc_ground_min_m)
+    gmsh.model.mesh.field.setNumber(threshold_ground, "SizeMax", lc_global_m)
+    gmsh.model.mesh.field.setNumber(threshold_ground, "DistMin", 0.0)
+    gmsh.model.mesh.field.setNumber(threshold_ground, "DistMax", dist_ground_max_m)
+
+    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_ground)
+
+    # -------------------------------------------------------------------------
+    # Mesh-generation options
+    # -------------------------------------------------------------------------
+
+    gmsh.option.setNumber("General.NumThreads", 1)
+    gmsh.option.setNumber("Mesh.RandomFactor", 0)
+
+    gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.RecombineAll", 0)
+
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+
+    gmsh.model.mesh.generate(gdim)
+    gmsh.model.mesh.setOrder(MESH_ORDER)
+    gmsh.model.mesh.optimize("Netgen")
+
+    gmsh.write(str(mesh_msh))
+
+    if GENERATE_GMSH_GUI:
+        gmsh.fltk.run()
+
+    print("\nPhysical curves:")
+    print(f"  Inlet:  {left_curve}")
+    print(f"  Outlet: {right_curve}")
+    print(f"  Bottom: {bottom_curve}")
+    print(f"  Top:    {top_curve}")
+
+    print("\nBoundary markers:")
+    print(f"  Inlet:  {inlet_marker}")
+    print(f"  Outlet: {outlet_marker}")
+    print(f"  Bottom: {bottom_marker}")
+    print(f"  Top:    {top_marker}")
+
+    print("\nCell markers:")
+    print(f"  Fluid:        {fluid_cell_marker}")
+    print(f"  ActuatorDisk: {actuator_disk_cell_marker}")
+
+    return disk_info
+
+
+# =============================================================================
+# ACTUATOR-DISK CELL TAGS
+# =============================================================================
+
+def create_actuator_disk_cell_tags(mesh, disk_info):
+    """
+    Create cell tags for the fluid and actuator-disk regions.
+
+    Marker convention:
+        1 -> Fluid
+        2 -> ActuatorDisk
+
+    The actuator-disk region is identified from the midpoint of each cell.
+    """
+
+    tdim = mesh.topology.dim
+
+    num_cells_local = mesh.topology.index_map(tdim).size_local
+    local_cells = np.arange(num_cells_local, dtype=np.int32)
+
+    midpoints = dmesh.compute_midpoints(mesh, tdim, local_cells)
+
+    cell_values = np.full(
+        num_cells_local,
+        fluid_cell_marker,
+        dtype=np.int32,
+    )
+
+    if TAG_ACTUATOR_DISK and disk_info is not None:
+        obs_x0 = disk_info["obs_x0"]
+        obs_x1 = disk_info["obs_x1"]
+        obs_y0 = disk_info["obs_y0"]
+        obs_y1 = disk_info["obs_y1"]
+
+        inside_disk = (
+            (midpoints[:, 0] >= obs_x0) &
+            (midpoints[:, 0] <= obs_x1) &
+            (midpoints[:, 1] >= obs_y0) &
+            (midpoints[:, 1] <= obs_y1)
+        )
+
+        cell_values[inside_disk] = actuator_disk_cell_marker
+
+        n_disk_local = int(np.count_nonzero(inside_disk))
+        n_disk_global = comm.allreduce(n_disk_local, op=MPI.SUM)
+
+        if comm.rank == model_rank:
+            print(f"\n[INFO] Cells tagged as ActuatorDisk = {n_disk_global}")
+
+            if n_disk_global == 0:
+                print(
+                    "[WARNING] No cells were tagged as ActuatorDisk.\n"
+                    "          Check obs_w_m, obs_h_m, hub_height_m, or mesh resolution."
+                )
+
+    cell_tags = dmesh.meshtags(
+        mesh,
+        tdim,
+        local_cells,
+        cell_values,
+    )
+
+    cell_tags.name = "cell_tags"
+
+    return cell_tags
+
+
+# =============================================================================
+# MAIN ROUTINE
+# =============================================================================
+
+def main():
+    """Generate, convert, tag, and save the terrain mesh."""
+
+    if comm.rank == model_rank:
+        case_dir = find_case_dir()
+        mesh_dir = Path(OUTPUT_DIRNAME)
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\nReading portable case from:")
+        print(f"  {case_dir.resolve()}")
+
+        terrain_x_m, terrain_z_m, cfg = load_case_data(case_dir)
+    else:
+        mesh_dir = Path(OUTPUT_DIRNAME)
+        terrain_x_m = None
+        terrain_z_m = None
+        cfg = None
+
+    comm.barrier()
+
+    mesh_xdmf = mesh_dir / "mesh.xdmf"
+    tags_xdmf = mesh_dir / "facet_tags.xdmf"
+    mesh_bp = mesh_dir / "mesh.bp"
+
+    gmsh.initialize()
+
+    if comm.rank == model_rank:
+        disk_info = build_mesh_from_portable_data(
+            terrain_x_m=terrain_x_m,
+            terrain_z_m=terrain_z_m,
+            cfg=cfg,
+            mesh_dir=mesh_dir,
+        )
+    else:
+        disk_info = None
+
+    disk_info = comm.bcast(disk_info, root=model_rank)
+
+    # -------------------------------------------------------------------------
+    # Convert the Gmsh model to a distributed DOLFINx mesh
+    # -------------------------------------------------------------------------
+
+    partitioner = create_cell_partitioner(GhostMode.none)
+
+    mesh_data = gmshio.model_to_mesh(
+        gmsh.model,
+        comm,
+        model_rank,
+        gdim=gdim,
+        partitioner=partitioner,
+    )
+
+    mesh = mesh_data.mesh
+    gmsh.finalize()
+
+    facet_tags = mesh_data.facet_tags
+    if facet_tags is None:
+        raise RuntimeError(
+            "facet_tags is None. Check the physical groups assigned to the boundaries."
+        )
+
+    facet_tags.name = "facet_tags"
+
+    cell_tags = create_actuator_disk_cell_tags(mesh, disk_info)
+
+    mesh.topology.create_entities(1)
+    mesh.topology.create_connectivity(
+        mesh.topology.dim - 1,
+        mesh.topology.dim,
+    )
+
+    # -------------------------------------------------------------------------
+    # Save XDMF outputs
+    # -------------------------------------------------------------------------
+
+    with XDMFFile(comm, mesh_xdmf, "w") as xdmf:
+        xdmf.write_mesh(mesh)
+
+    with XDMFFile(comm, tags_xdmf, "w") as xdmf:
+        xdmf.write_mesh(mesh)
+        xdmf.write_meshtags(cell_tags, mesh.geometry)
+        xdmf.write_meshtags(facet_tags, mesh.geometry)
+
+    # -------------------------------------------------------------------------
+    # Save ADIOS2/BP outputs
+    # -------------------------------------------------------------------------
+
+    if comm.rank == model_rank and mesh_bp.exists():
+        shutil.rmtree(mesh_bp)
+
+    comm.barrier()
+
+    adios4dolfinx.write_mesh(mesh_bp, mesh, engine="BP4")
+
+    adios4dolfinx.write_meshtags(
+        mesh_bp,
+        mesh,
+        cell_tags,
+        meshtag_name="cell_tags",
+        engine="BP4",
+    )
+
+    adios4dolfinx.write_meshtags(
+        mesh_bp,
+        mesh,
+        facet_tags,
+        meshtag_name="facet_tags",
+        engine="BP4",
+    )
+
+    if comm.rank == model_rank:
+        print("\nMesh generated successfully.")
+        print(f"Saved XDMF mesh to:       {mesh_xdmf}")
+        print(f"Saved tags XDMF to:       {tags_xdmf}")
+        print(f"Saved ADIOS mesh+tags to: {mesh_bp}")
+        print(f"Saved raw Gmsh mesh to:   {mesh_dir / 'mesh.msh'}")
+        print("\nParaView inspection:")
+        print("  - Color By: cell_tags")
+        print("      1 = Fluid")
+        print("      2 = ActuatorDisk")
+        print("  - Color By: facet_tags")
+        print("      2 = Inlet")
+        print("      3 = Outlet")
+        print("      4 = Bottom")
+        print("      5 = Top")
+
+
+if __name__ == "__main__":
+    main()

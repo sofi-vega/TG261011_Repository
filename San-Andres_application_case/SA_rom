@@ -1,0 +1,1235 @@
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import ufl
+import adios4dolfinx
+
+from mpi4py import MPI
+from petsc4py import PETSc
+
+from basix.ufl import element, mixed_element
+from dolfinx import fem
+from dolfinx.fem import (
+    Constant,
+    Function,
+    dirichletbc,
+    functionspace,
+    locate_dofs_topological,
+)
+from dolfinx.fem import petsc as fem_petsc
+from dolfinx.io import XDMFFile
+from dolfinx.mesh import locate_entities_boundary
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# =============================================================================
+# MPI configuration
+# =============================================================================
+
+start_time = datetime.now()
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
+
+def mpi_print(*args, **kwargs):
+    if rank == 0:
+        print(*args, **kwargs)
+
+
+if rank == 0 and size != 1:
+    print(
+        "\nWARNING: This ROM implementation stores the reduced basis as local "
+        "NumPy arrays. Run in serial unless the basis construction is "
+        "parallelized.\n"
+    )
+
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+BASE_RESULTS_DIR = Path("resultsTriplariswTurbine")
+RUNS_ROOT = BASE_RESULTS_DIR / "rom_basis_sweep"
+
+RESULTS_DIR = RUNS_ROOT / "r_000"
+RESULTS_BP = RESULTS_DIR / "rom_terrain_turbine.bp"
+
+BASIS_BP = BASE_RESULTS_DIR / "basis" / "fom.basis.bp"
+MESH_BP = Path("mesh") / "mesh.bp"
+
+
+# =============================================================================
+# Case markers and inlet data
+# =============================================================================
+
+FLUID_MARKER = 1
+DISK_MARKER = 2
+
+INLET_MARKER = 2
+OUTLET_MARKER = 3
+WALL_MARKER = 4
+
+UREF_INLET = 7.196
+ZREF_INLET = 100.0
+ALPHA_INLET = 0.13
+Y_ORIGIN_INLET = 5.0
+Z_MIN_INLET = 1.0
+
+AD_CT = 0.89
+AD_DELTA = 12.5
+AD_N = (1.0, 0.0)
+
+
+# =============================================================================
+# BP4 reading utilities
+# =============================================================================
+
+def try_read_mesh(paths):
+    """Read the mesh from the first available BP4 source."""
+
+    last_error = None
+
+    for path in paths:
+        try:
+            mesh_ = adios4dolfinx.read_mesh(path, comm, engine="BP4")
+            mpi_print(f"Mesh read from: {path}")
+            return mesh_, path
+
+        except Exception as exc:
+            last_error = exc
+            mpi_print(f"Could not read mesh from {path}: {exc}")
+
+    raise RuntimeError(
+        "Could not read the mesh from any source. Check BASIS_BP and MESH_BP."
+    ) from last_error
+
+
+def try_read_meshtags(mesh_, tag_name, paths):
+    """Read mesh tags from the first available BP4 source."""
+
+    last_error = None
+
+    for path in paths:
+        try:
+            tags = adios4dolfinx.read_meshtags(
+                path,
+                mesh_,
+                meshtag_name=tag_name,
+                engine="BP4",
+            )
+            tags.name = tag_name
+
+            mpi_print(f"{tag_name} read from: {path}")
+            return tags
+
+        except Exception as exc:
+            last_error = exc
+            mpi_print(f"Could not read {tag_name} from {path}: {exc}")
+
+    raise RuntimeError(
+        f"Could not read {tag_name}. Check BASIS_BP or mesh/mesh.bp."
+    ) from last_error
+
+
+# =============================================================================
+# Mesh, tags, and measures
+# =============================================================================
+
+mesh, mesh_source = try_read_mesh([BASIS_BP, MESH_BP])
+
+tdim = mesh.topology.dim
+fdim = tdim - 1
+gdim = mesh.geometry.dim
+
+mesh.topology.create_entities(fdim)
+mesh.topology.create_connectivity(fdim, tdim)
+mesh.topology.create_connectivity(tdim, fdim)
+
+ft = try_read_meshtags(mesh, "facet_tags", [BASIS_BP, MESH_BP])
+ct = try_read_meshtags(mesh, "cell_tags", [BASIS_BP, MESH_BP])
+
+dx = ufl.Measure("dx", domain=mesh)
+ds = ufl.Measure("ds", domain=mesh, subdomain_data=ft)
+
+
+# =============================================================================
+# Actuator-disk indicator
+# =============================================================================
+
+def create_actuator_disk_indicator(mesh_, ct_):
+    """Create a DG0 indicator field for the actuator-disk region."""
+
+    V0 = functionspace(mesh_, ("DG", 0))
+
+    chi = Function(V0)
+    chi.name = "chi_actuator_disk"
+    chi.x.array[:] = 0.0
+
+    disk_cells = ct_.find(DISK_MARKER)
+
+    for cell in disk_cells:
+        dofs = V0.dofmap.cell_dofs(cell)
+        chi.x.array[dofs] = PETSc.ScalarType(1.0)
+
+    chi.x.scatter_forward()
+
+    n_local = len(disk_cells)
+    n_global = comm.allreduce(n_local, op=MPI.SUM)
+
+    mpi_print("Actuator disk indicator created.")
+    mpi_print(f"  disk marker = {DISK_MARKER}")
+    mpi_print(f"  local/global disk cells = {n_local}/{n_global}")
+
+    if rank == 0 and n_global == 0:
+        print(
+            "WARNING: No cells were found for the actuator-disk marker. "
+            "Check the cell tags in the mesh or basis file."
+        )
+
+    return chi
+
+
+chi_ad = create_actuator_disk_indicator(mesh, ct)
+
+
+# =============================================================================
+# Inlet profile
+# =============================================================================
+
+def detect_inlet_height(mesh_):
+    """Detect the vertical extent of the inlet boundary."""
+
+    x_coords = mesh_.geometry.x[:, 0]
+    y_coords = mesh_.geometry.x[:, 1]
+
+    x_min_local = np.min(x_coords)
+    x_min = comm.allreduce(x_min_local, op=MPI.MIN)
+
+    tol = 1.0e-8 * max(1.0, abs(x_min))
+    mask = np.isclose(x_coords, x_min, atol=tol)
+
+    if np.any(mask):
+        y_min_local = np.min(y_coords[mask])
+        y_max_local = np.max(y_coords[mask])
+    else:
+        y_min_local = np.min(y_coords)
+        y_max_local = np.max(y_coords)
+
+    y_min = comm.allreduce(y_min_local, op=MPI.MIN)
+    y_max = comm.allreduce(y_max_local, op=MPI.MAX)
+
+    mpi_print("Inlet height diagnostic:")
+    mpi_print(f"  y_min_inlet = {y_min}")
+    mpi_print(f"  y_max_inlet = {y_max}")
+    mpi_print(f"  inlet height = {y_max - y_min}")
+
+    return y_min, y_max
+
+
+y_min_inlet, y_max_inlet = detect_inlet_height(mesh)
+
+
+class InletVelocity:
+    """Power-law atmospheric inlet profile."""
+
+    def __init__(
+        self,
+        UREF=7.196,
+        ZREF=100.0,
+        ALPHA=0.13,
+        Y_ORIGIN=5.0,
+        Z_MIN=1.0,
+    ):
+        self.UREF = UREF
+        self.ZREF = ZREF
+        self.ALPHA = ALPHA
+        self.Y_ORIGIN = Y_ORIGIN
+        self.Z_MIN = Z_MIN
+
+    def __call__(self, x):
+        values = np.zeros((gdim, x.shape[1]), dtype=PETSc.ScalarType)
+
+        y = x[1]
+        z_real = y - self.Y_ORIGIN
+        z_eff = np.maximum(z_real, self.Z_MIN)
+
+        values[0] = self.UREF * (z_eff / self.ZREF) ** self.ALPHA
+        values[1] = 0.0
+
+        return values
+
+
+def plot_inlet_velocity_profile():
+    """Save the inlet velocity profile used by the ROM simulation."""
+
+    if rank != 0:
+        return
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    y_plot = np.linspace(y_min_inlet, y_max_inlet, 300)
+    z_real = y_plot - Y_ORIGIN_INLET
+    z_eff = np.maximum(z_real, Z_MIN_INLET)
+
+    u_plot = UREF_INLET * (z_eff / ZREF_INLET) ** ALPHA_INLET
+
+    plt.figure(figsize=(6, 7))
+    plt.plot(u_plot, y_plot, linewidth=2)
+    plt.xlabel(r"Inlet velocity $u_x$ [m/s]")
+    plt.ylabel(r"Vertical coordinate $y$ [m]")
+    plt.title("Terrain ROM inlet velocity profile")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "inlet_velocity_profile_rom.png", dpi=300)
+    plt.close()
+
+
+# =============================================================================
+# Function spaces and boundary conditions
+# =============================================================================
+
+def build_space(mesh_, u_in):
+    """Build the mixed finite-element space and boundary conditions."""
+
+    global poly
+
+    poly = 1
+
+    Pu = element("Lagrange", mesh_.basix_cell(), poly, shape=(gdim,))
+    Pp = element("Lagrange", mesh_.basix_cell(), poly)
+
+    TH = mixed_element([Pu, Pp])
+    W_ = functionspace(mesh_, TH)
+
+    V_, map_u_ = W_.sub(0).collapse()
+    Q_, map_p_ = W_.sub(1).collapse()
+
+    VisSpace_ = functionspace(mesh_, Pp)
+
+    u_inlet_ = Function(V_)
+    u_inlet_.interpolate(u_in)
+    u_inlet_.x.scatter_forward()
+
+    u_zero = Function(V_)
+    u_zero.x.array[:] = 0.0
+    u_zero.x.scatter_forward()
+
+    p_outlet = Function(Q_)
+    p_outlet.x.array[:] = 0.0
+    p_outlet.x.scatter_forward()
+
+    y_local_max = np.max(mesh_.geometry.x[:, 1])
+    y_top = comm.allreduce(y_local_max, op=MPI.MAX)
+
+    y_local_min = np.min(mesh_.geometry.x[:, 1])
+    y_min = comm.allreduce(y_local_min, op=MPI.MIN)
+
+    tol_top = 1.0e-8 * max(1.0, abs(y_top - y_min))
+
+    top_facets_all = locate_entities_boundary(
+        mesh_,
+        fdim,
+        lambda x: np.isclose(x[1], y_top, atol=tol_top),
+    )
+
+    wall_facets_all = ft.find(WALL_MARKER)
+    top_wall_facets = np.intersect1d(wall_facets_all, top_facets_all)
+    wall_facets_no_top = np.setdiff1d(wall_facets_all, top_wall_facets)
+
+    n_wall_total = comm.allreduce(len(wall_facets_all), op=MPI.SUM)
+    n_top = comm.allreduce(len(top_wall_facets), op=MPI.SUM)
+    n_wall_no_top = comm.allreduce(len(wall_facets_no_top), op=MPI.SUM)
+
+    mpi_print("Open top boundary configuration:")
+    mpi_print(f"  y_top = {y_top}")
+    mpi_print(f"  total wall facets = {n_wall_total}")
+    mpi_print(f"  top facets removed from no-slip = {n_top}")
+    mpi_print(f"  no-slip wall facets = {n_wall_no_top}")
+
+    dofs_walls = locate_dofs_topological(
+        (W_.sub(0), V_),
+        fdim,
+        wall_facets_no_top,
+    )
+    bc_walls = dirichletbc(u_zero, dofs_walls, W_.sub(0))
+
+    dofs_in = locate_dofs_topological(
+        (W_.sub(0), V_),
+        fdim,
+        ft.find(INLET_MARKER),
+    )
+    bc_in = dirichletbc(u_inlet_, dofs_in, W_.sub(0))
+
+    dofs_out = locate_dofs_topological(
+        (W_.sub(1), Q_),
+        fdim,
+        ft.find(OUTLET_MARKER),
+    )
+    bc_out = dirichletbc(p_outlet, dofs_out, W_.sub(1))
+
+    bcs_ = [bc_walls, bc_in, bc_out]
+
+    return W_, V_, Q_, map_u_, map_p_, bcs_, VisSpace_, u_inlet_
+
+
+# =============================================================================
+# Variational Multiscale operators
+# =============================================================================
+
+def epsilon(u):
+    return ufl.sym(ufl.grad(u))
+
+
+def Viscosity(wk, n_, m_):
+    uk = ufl.as_vector((wk[0], wk[1]))
+    gamma = epsilon(uk)
+    gamma_dot = ufl.sqrt(0.5 * ufl.inner(gamma, gamma)) + 1.0e-6
+
+    visc_trial = m_ * (gamma_dot ** (n_ - 1))
+
+    low_lim = m_ / 10000.0
+    high_lim = m_ * 10000.0
+
+    return ufl.conditional(
+        visc_trial <= low_lim,
+        low_lim,
+        ufl.conditional(visc_trial >= high_lim, high_lim, visc_trial),
+    )
+
+
+def tau(wk, dt_, visco):
+    u_k = ufl.as_vector((wk[0], wk[1]))
+
+    normu = ufl.sqrt(ufl.dot(u_k, u_k))
+    h = ufl.JacobianDeterminant(W.mesh) ** (1.0 / gdim)
+
+    freq1 = C1 * visco / (h / poly**2) ** 2
+    freq2 = C2 * rho * normu / (h / poly)
+    freqt = C4 * rho / dt_
+
+    freq_total = freq1 + freq2 + freqt
+
+    timom = ufl.conditional(freq_total < 1.0e-4, 1.0e12, 1.0 / freq_total)
+    tidiv = C3 * (h / poly**2) ** 2 / (timom * C1)
+
+    return ufl.as_matrix(
+        (
+            (timom, 0.0, 0.0),
+            (0.0, timom, 0.0),
+            (0.0, 0.0, tidiv),
+        )
+    )
+
+
+def tau_in(tau_mat):
+    return ufl.as_matrix(
+        (
+            (1.0 / tau_mat[0, 0], 0.0, 0.0),
+            (0.0, 1.0 / tau_mat[1, 1], 0.0),
+            (0.0, 0.0, 1.0 / tau_mat[2, 2]),
+        )
+    )
+
+
+def tau_d(wk, dt_, visco):
+    Taui = tau_in(tau(wk, dt_, visco))
+
+    M1 = (1.0 / dt_) * int_sgs[0] * rho + Taui[0, 0]
+    M2 = (1.0 / dt_) * int_sgs[0] * rho + Taui[1, 1]
+
+    return ufl.as_matrix(
+        (
+            (1.0 / M1, 0.0, 0.0),
+            (0.0, 1.0 / M2, 0.0),
+            (0.0, 0.0, 1.0 / Taui[2, 2]),
+        )
+    )
+
+
+def Lc(w, wk):
+    u = ufl.as_vector((w[0], w[1]))
+    uk = ufl.as_vector((wk[0], wk[1]))
+
+    Au = rho * (ufl.grad(u) * uk)
+
+    return ufl.as_vector((Au[0], Au[1], 0.0))
+
+
+def Lp(w):
+    p = w[2]
+    Ap = ufl.grad(p)
+
+    return ufl.as_vector((Ap[0], Ap[1], 0.0))
+
+
+def Ldiv(w):
+    u = ufl.as_vector((w[0], w[1]))
+
+    return ufl.as_vector((0.0, 0.0, ufl.div(u)))
+
+
+_proj_cache = {}
+
+
+def project(expr, target_space):
+    """Compute an L2 projection using a cached linear solver."""
+
+    key = id(target_space)
+
+    if key not in _proj_cache:
+        u_t = ufl.TrialFunction(target_space)
+        v_t = ufl.TestFunction(target_space)
+        dx_local = ufl.Measure("dx", domain=target_space.mesh)
+
+        a_proj = fem.form(ufl.inner(u_t, v_t) * dx_local)
+
+        A_proj = fem_petsc.assemble_matrix(a_proj)
+        A_proj.assemble()
+
+        ksp_proj = PETSc.KSP().create(target_space.mesh.comm)
+        ksp_proj.setOperators(A_proj)
+        ksp_proj.setType("preonly")
+
+        pc = ksp_proj.getPC()
+        pc.setType("lu")
+
+        ksp_proj.setFromOptions()
+
+        _proj_cache[key] = (A_proj, ksp_proj)
+
+    A_proj, ksp_proj = _proj_cache[key]
+
+    v_t = ufl.TestFunction(target_space)
+    dx_local = ufl.Measure("dx", domain=target_space.mesh)
+
+    L_proj = fem.form(ufl.inner(expr, v_t) * dx_local)
+
+    b_proj = fem_petsc.assemble_vector(L_proj)
+    b_proj.ghostUpdate(
+        addv=PETSc.InsertMode.ADD,
+        mode=PETSc.ScatterMode.REVERSE,
+    )
+
+    uh = fem.Function(target_space)
+    ksp_proj.solve(b_proj, uh.x.petsc_vec)
+    uh.x.scatter_forward()
+
+    return uh
+
+
+def Subscales1(w, wk, dt_, visco):
+    """Convective subscale contribution."""
+
+    return tau_d(wk, dt_, visco) * (-Lc(w, wk) - project(-Lc(wk, wk), W))
+
+
+def Subscales2(w, wk, dt_, visco):
+    """Pressure-gradient subscale contribution."""
+
+    return tau_d(wk, dt_, visco) * (-Lp(w) - project(-Lp(wk), W))
+
+
+def Subscales3(w, wk, dt_, visco):
+    """Divergence subscale contribution."""
+
+    return tau_d(wk, dt_, visco) * (-Ldiv(w) - project(-Ldiv(wk), W))
+
+
+def Subscalesd(w, wk, dt_, y_old, y_oold, y_ooold, visco):
+    """Dynamic subscale contribution from time-history terms."""
+
+    Ytt = (1.0 / dt_) * int_sgs[1] * y_old
+    Yttt = (1.0 / dt_) * int_sgs[2] * y_oold
+    Ytttt = (1.0 / dt_) * int_sgs[3] * y_ooold
+
+    return tau_d(wk, dt_, visco) * ufl.as_vector(
+        (
+            -rho * Ytt[0] - rho * Yttt[0] - rho * Ytttt[0],
+            -rho * Ytt[1] - rho * Yttt[1] - rho * Ytttt[1],
+            0.0,
+        )
+    )
+
+
+def actuator_disk_force(u, u_k):
+    """Linearized actuator-disk momentum sink."""
+
+    ukn = ufl.dot(u_k, n_ad)
+    ukn_abs = ufl.sqrt(ukn * ukn + PETSc.ScalarType(1.0e-12))
+
+    return (
+        -chi_ad
+        * 0.5
+        * rho
+        * Ct
+        * ukn_abs
+        * ufl.dot(u, n_ad)
+        / delta
+        * n_ad
+    )
+
+
+def VarFormNS(
+    w,
+    wk,
+    w_,
+    w_old,
+    w_oold,
+    w_ooold,
+    y1_old,
+    y1_oold,
+    y1_ooold,
+    y2_old,
+    y2_oold,
+    y2_ooold,
+    visco,
+    dt_,
+):
+    """VMS-stabilized weak form with actuator-disk forcing."""
+
+    u = ufl.as_vector((w[0], w[1]))
+    p = w[2]
+
+    uk = ufl.as_vector((wk[0], wk[1]))
+
+    v = ufl.as_vector((w_[0], w_[1]))
+    q = w_[2]
+
+    f_ad = actuator_disk_force(u, uk)
+
+    F_G = (
+        2.0 * visco * ufl.inner(epsilon(u), epsilon(v))
+        + ufl.inner(rho * ufl.dot(ufl.grad(u), uk), v)
+        - ufl.inner(p, ufl.div(v))
+        + ufl.div(u) * q
+        - ufl.inner(f_ad, v)
+    ) * dx
+
+    F_S1 = ufl.inner(Subscales1(w, wk, dt_, visco), -Lc(w_, wk)) * dx
+    F_S2 = ufl.inner(Subscales2(w, wk, dt_, visco), -Lp(w_)) * dx
+    F_S3 = ufl.inner(Subscales3(w, wk, dt_, visco), -Ldiv(w_)) * dx
+
+    F_D = ufl.inner(
+        Subscalesd(w, wk, dt_, y1_old, y1_oold, y1_ooold, visco),
+        -Lc(w_, wk),
+    ) * dx
+
+    F_DD = ufl.inner(
+        Subscalesd(w, wk, dt_, y2_old, y2_oold, y2_ooold, visco),
+        -Lp(w_),
+    ) * dx
+
+    return F_G + F_S1 + F_S2 + F_S3 + F_D + F_DD
+
+
+# =============================================================================
+# Basis loading and reduced projection
+# =============================================================================
+
+def load_basis(W_, V_, Q_, map_u_, map_p_):
+    """Read the mean field and POD modes from the BP4 basis file."""
+
+    mpi_print("Loading ROM basis...")
+
+    u_fn = Function(V_)
+    p_fn = Function(Q_)
+
+    try:
+        adios4dolfinx.read_function(BASIS_BP, u_fn, time=-1.0, name="u", engine="BP4")
+        adios4dolfinx.read_function(BASIS_BP, p_fn, time=-1.0, name="p", engine="BP4")
+        mean_time_used = -1.0
+
+    except Exception:
+        adios4dolfinx.read_function(BASIS_BP, u_fn, time=0.0, name="u", engine="BP4")
+        adios4dolfinx.read_function(BASIS_BP, p_fn, time=0.0, name="p", engine="BP4")
+        mean_time_used = 0.0
+
+    u_fn.x.scatter_forward()
+    p_fn.x.scatter_forward()
+
+    w_mean_fn = Function(W_)
+    w_mean_fn.x.array[map_u_] = u_fn.x.array
+    w_mean_fn.x.array[map_p_] = p_fn.x.array
+    w_mean_fn.x.scatter_forward()
+
+    wbasis_mean = w_mean_fn.x.array.copy()
+
+    all_times = adios4dolfinx.read_timestamps(BASIS_BP, comm, "u", engine="BP4")
+
+    if mean_time_used < 0.0:
+        mode_times = sorted([tt for tt in all_times if tt >= 0.0])
+    else:
+        mode_times = sorted([tt for tt in all_times if tt > 0.0])
+
+    n_available = len(mode_times)
+    r_used = min(rsize, n_available)
+
+    mpi_print(f"  Mean read at t = {mean_time_used}")
+    mpi_print(f"  Available modes = {n_available}")
+    mpi_print(f"  Modes used = {r_used}")
+
+    if r_used <= 0:
+        raise RuntimeError("No POD modes were found in the basis file.")
+
+    N_dofs = len(wbasis_mean)
+    upbasis = np.zeros((N_dofs, r_used), dtype=np.float64)
+
+    for k, tt in enumerate(mode_times[:r_used]):
+        adios4dolfinx.read_function(BASIS_BP, u_fn, time=tt, name="u", engine="BP4")
+        adios4dolfinx.read_function(BASIS_BP, p_fn, time=tt, name="p", engine="BP4")
+
+        u_fn.x.scatter_forward()
+        p_fn.x.scatter_forward()
+
+        w_mode = Function(W_)
+        w_mode.x.array[map_u_] = u_fn.x.array
+        w_mode.x.array[map_p_] = p_fn.x.array
+        w_mode.x.scatter_forward()
+
+        upbasis[:, k] = w_mode.x.array[:]
+
+        mpi_print(f"  Loaded mode {k + 1}/{r_used} from t = {tt}")
+
+    return wbasis_mean, upbasis, r_used
+
+
+def build_petsc_basis(upbasis, mesh_):
+    """Build the PETSc dense matrix containing the reduced basis."""
+
+    Ndofs, r_used = upbasis.shape
+
+    Phi = PETSc.Mat().createDense([Ndofs, r_used], comm=mesh_.comm)
+    Phi.setUp()
+
+    rows = np.arange(Ndofs, dtype=PETSc.IntType)
+
+    for j in range(r_used):
+        Phi.setValues(rows, [PETSc.IntType(j)], upbasis[:, j])
+
+    Phi.assemble()
+
+    return Phi
+
+
+def solve_reduced_galerkin_petsc(A, b, Phi, w_mean_fun, wbasis_mean, upbasis):
+    """Solve the Galerkin-projected reduced system using PETSc products."""
+
+    APhi = A.matMult(Phi)
+    K_rom_mat = Phi.transposeMatMult(APhi)
+
+    Awmean = b.duplicate()
+    A.mult(w_mean_fun.x.petsc_vec, Awmean)
+
+    b_tilde = b.duplicate()
+    b_tilde.waxpy(-1.0, Awmean, b)
+
+    rhs_vec = Phi.createVecRight()
+    Phi.multTranspose(b_tilde, rhs_vec)
+
+    K_rom = K_rom_mat.getDenseArray().copy()
+    rhs_r = rhs_vec.getArray(readonly=True).copy()
+
+    K_rom = K_rom + rom_regularization * np.eye(K_rom.shape[0])
+
+    alpha_rom = np.linalg.solve(K_rom, rhs_r)
+    uvec = wbasis_mean + upbasis @ alpha_rom
+
+    return uvec
+
+
+# =============================================================================
+# ROM solver
+# =============================================================================
+
+def solve_rom(
+    W_,
+    V_,
+    Q_,
+    map_u_,
+    map_p_,
+    bcs_u_,
+    FinalTime_,
+    dt_,
+    theta_,
+    mesh_,
+    VisSpace_,
+    u_inlet_,
+    u_in,
+):
+    """Run the transient ROM simulation."""
+
+    w = ufl.TrialFunction(W_)
+    z = ufl.TestFunction(W_)
+
+    y1_old = Function(W_)
+    y1_oold = Function(W_)
+    y1_ooold = Function(W_)
+
+    y2_old = Function(W_)
+    y2_oold = Function(W_)
+    y2_ooold = Function(W_)
+
+    w_old = Function(W_)
+    w_oold = Function(W_)
+    w_ooold = Function(W_)
+    w_i = Function(W_)
+    w_inc = Function(W_)
+
+    for f in [
+        y1_old,
+        y1_oold,
+        y1_ooold,
+        y2_old,
+        y2_oold,
+        y2_ooold,
+        w_old,
+        w_oold,
+        w_ooold,
+        w_i,
+        w_inc,
+    ]:
+        f.x.array[:] = 0.0
+        f.x.scatter_forward()
+
+    u_vis = Function(V_)
+    u_vis.name = "velocity"
+
+    p_vis = Function(Q_)
+    p_vis.name = "pressure"
+
+    us1_vis = Function(V_)
+    us1_vis.name = "velocity_subscale1"
+
+    us2_vis = Function(V_)
+    us2_vis.name = "velocity_subscale2"
+
+    visco_vis = Function(VisSpace_)
+    visco_vis.name = "viscosity"
+
+    if rank == 0:
+        if RESULTS_DIR.exists():
+            shutil.rmtree(RESULTS_DIR)
+
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Writing ROM outputs to: {RESULTS_DIR}")
+
+    comm.Barrier()
+
+    chi_file = XDMFFile(comm, RESULTS_DIR / "actuator_disk_indicator.xdmf", "w")
+    chi_file.write_mesh(mesh_)
+    chi_file.write_function(chi_ad, 0.0)
+    chi_file.close()
+
+    ufile = XDMFFile(comm, RESULTS_DIR / "velocity.xdmf", "w")
+    pfile = XDMFFile(comm, RESULTS_DIR / "pressure.xdmf", "w")
+    us1file = XDMFFile(comm, RESULTS_DIR / "velocity_subscale1.xdmf", "w")
+    us2file = XDMFFile(comm, RESULTS_DIR / "velocity_subscale2.xdmf", "w")
+    vfile = XDMFFile(comm, RESULTS_DIR / "viscosity.xdmf", "w")
+
+    for output_file in [ufile, pfile, us1file, us2file, vfile]:
+        output_file.write_mesh(mesh_)
+
+    adios4dolfinx.write_mesh(RESULTS_BP, mesh_, engine="BP4")
+    adios4dolfinx.write_meshtags(
+        RESULTS_BP,
+        mesh_,
+        ft,
+        meshtag_name="facet_tags",
+        engine="BP4",
+    )
+    adios4dolfinx.write_meshtags(
+        RESULTS_BP,
+        mesh_,
+        ct,
+        meshtag_name="cell_tags",
+        engine="BP4",
+    )
+
+    wbasis_mean, upbasis, r_used = load_basis(W_, V_, Q_, map_u_, map_p_)
+    Phi = build_petsc_basis(upbasis, mesh_)
+
+    w_mean_fun = Function(W_)
+    w_mean_fun.x.array[:] = wbasis_mean
+    w_mean_fun.x.scatter_forward()
+
+    for f in [w_i, w_old, w_oold, w_ooold]:
+        f.x.array[:] = wbasis_mean
+        f.x.scatter_forward()
+
+    next_xdmf_time = 0.0
+    next_bp_time = init_snap
+    time_tol = max(1.0e-12, 1.0e-9 * dt_)
+
+    expected_snapshots = (
+        int(np.floor((FinalTime_ - init_snap) / inte_snap)) + 1
+        if inte_snap > 0
+        else 0
+    )
+
+    mpi_print(f"ROM size requested/used = {rsize}/{r_used}")
+    mpi_print(f"Expected BP snapshots = {max(expected_snapshots, 0)}")
+    mpi_print(f"BP save interval = {inte_snap} s")
+    mpi_print(f"XDMF save interval = {inte_xdmf} s")
+
+    time = 0.0
+    step = 0
+
+    while time <= FinalTime_ + time_tol:
+        mpi_print(f"---- Time instant = {time:g} ----")
+
+        u_inlet_.interpolate(u_in)
+        u_inlet_.x.scatter_forward()
+
+        Ftt = (theta_[1] / dt_) * rho * w_old
+        Fttt = (theta_[2] / dt_) * rho * w_oold
+        Ftttt = (theta_[3] / dt_) * rho * w_ooold
+
+        L2_error_u = 1.0
+        it = 0
+
+        while L2_error_u > tol_NL and it < maxiter_NL:
+            it += 1
+
+            visco = Constant(mesh_, PETSc.ScalarType(m)) if n == 1 else Viscosity(w_i, n, m)
+
+            FL = VarFormNS(
+                w,
+                w_i,
+                z,
+                w_old,
+                w_oold,
+                w_ooold,
+                y1_old,
+                y1_oold,
+                y1_ooold,
+                y2_old,
+                y2_oold,
+                y2_ooold,
+                visco,
+                dt_,
+            )
+
+            Ft = (theta_[0] / dt_) * rho * w
+
+            Du = ufl.dot(
+                ufl.as_vector(
+                    (
+                        Ft[0] + Ftt[0] + Fttt[0] + Ftttt[0],
+                        Ft[1] + Ftt[1] + Fttt[1] + Ftttt[1],
+                        0.0,
+                    )
+                ),
+                z,
+            ) * dx
+
+            F = FL + Du
+
+            a_form = fem.form(ufl.lhs(F))
+            L_form = fem.form(ufl.rhs(F))
+
+            A = fem_petsc.assemble_matrix(a_form, bcs=bcs_u_)
+            A.assemble()
+
+            b = fem_petsc.assemble_vector(L_form)
+            fem_petsc.apply_lifting(b, [a_form], [bcs_u_])
+            b.ghostUpdate(
+                addv=PETSc.InsertMode.ADD,
+                mode=PETSc.ScatterMode.REVERSE,
+            )
+            fem_petsc.set_bc(b, bcs_u_)
+
+            uvec = solve_reduced_galerkin_petsc(
+                A,
+                b,
+                Phi,
+                w_mean_fun,
+                wbasis_mean,
+                upbasis,
+            )
+
+            w_inc.x.array[:] = np.ascontiguousarray(uvec)
+            w_inc.x.scatter_forward()
+
+            u_inc_expr, _ = ufl.split(w_inc)
+            u_i_expr, _ = ufl.split(w_i)
+
+            L2_error_local = fem.assemble_scalar(
+                fem.form(
+                    ufl.inner(
+                        u_inc_expr - u_i_expr,
+                        u_inc_expr - u_i_expr,
+                    ) * dx
+                )
+            )
+            L2_error_u = comm.allreduce(L2_error_local, op=MPI.SUM)
+
+            mpi_print(f"  it = {it}: L2-error-NL = {L2_error_u:g}")
+
+            w_i.x.array[:] = alpha_U * w_inc.x.array + (1.0 - alpha_U) * w_i.x.array
+            w_i.x.scatter_forward()
+
+            if it == maxiter_NL:
+                mpi_print("  Warning: nonlinear ROM iteration did not converge.")
+
+        y1_new = project(
+            Subscales1(w_inc, w_i, dt_, visco)
+            + Subscalesd(w_inc, w_i, dt_, y1_old, y1_oold, y1_ooold, visco),
+            W_,
+        )
+
+        y2_new = project(
+            Subscales2(w_inc, w_i, dt_, visco)
+            + Subscalesd(w_inc, w_i, dt_, y2_old, y2_oold, y2_ooold, visco),
+            W_,
+        )
+
+        y1_ooold.x.array[:] = y1_oold.x.array
+        y1_ooold.x.scatter_forward()
+
+        y1_oold.x.array[:] = y1_old.x.array
+        y1_oold.x.scatter_forward()
+
+        y1_old.x.array[:] = y1_new.x.array
+        y1_old.x.scatter_forward()
+
+        y2_ooold.x.array[:] = y2_oold.x.array
+        y2_ooold.x.scatter_forward()
+
+        y2_oold.x.array[:] = y2_old.x.array
+        y2_oold.x.scatter_forward()
+
+        y2_old.x.array[:] = y2_new.x.array
+        y2_old.x.scatter_forward()
+
+        w_ooold.x.array[:] = w_oold.x.array
+        w_ooold.x.scatter_forward()
+
+        w_oold.x.array[:] = w_old.x.array
+        w_oold.x.scatter_forward()
+
+        w_old.x.array[:] = w_inc.x.array
+        w_old.x.scatter_forward()
+
+        w_i.x.array[:] = w_inc.x.array
+        w_i.x.scatter_forward()
+
+        u_vis.x.array[:] = w_inc.x.array[map_u_]
+        u_vis.x.scatter_forward()
+
+        p_vis.x.array[:] = w_inc.x.array[map_p_]
+        p_vis.x.scatter_forward()
+
+        us1_vis.x.array[:] = y1_new.x.array[map_u_]
+        us1_vis.x.scatter_forward()
+
+        us2_vis.x.array[:] = y2_new.x.array[map_u_]
+        us2_vis.x.scatter_forward()
+
+        visco_out = project(Constant(mesh_, PETSc.ScalarType(m)), VisSpace_)
+        visco_vis.x.array[:] = visco_out.x.array
+        visco_vis.x.scatter_forward()
+
+        if inte_xdmf > 0 and time + time_tol >= next_xdmf_time:
+            ufile.write_function(u_vis, time)
+            pfile.write_function(p_vis, time)
+            us1file.write_function(us1_vis, time)
+            us2file.write_function(us2_vis, time)
+            vfile.write_function(visco_vis, time)
+
+            mpi_print(f"  XDMF saved at t = {time:g}")
+            next_xdmf_time += inte_xdmf
+
+        if inte_snap > 0 and time + time_tol >= next_bp_time:
+            comm.Barrier()
+
+            adios4dolfinx.write_function(
+                RESULTS_BP,
+                u_vis,
+                time=time,
+                name="u",
+                engine="BP4",
+            )
+            adios4dolfinx.write_function(
+                RESULTS_BP,
+                p_vis,
+                time=time,
+                name="p",
+                engine="BP4",
+            )
+            adios4dolfinx.write_function(
+                RESULTS_BP,
+                visco_vis,
+                time=time,
+                name="viscosity",
+                engine="BP4",
+            )
+            adios4dolfinx.write_function(
+                RESULTS_BP,
+                us1_vis,
+                time=time,
+                name="velocity_subscale1",
+                engine="BP4",
+            )
+            adios4dolfinx.write_function(
+                RESULTS_BP,
+                us2_vis,
+                time=time,
+                name="velocity_subscale2",
+                engine="BP4",
+            )
+
+            mpi_print(f"  BP snapshot saved at t = {time:g}")
+            next_bp_time += inte_snap
+
+        if L2_error_u < tolSteady and it == 1:
+            mpi_print("  Steady solution reached.")
+            break
+
+        step += 1
+        time += dt_
+
+    ufile.close()
+    pfile.close()
+    us1file.close()
+    us2file.close()
+    vfile.close()
+
+
+# =============================================================================
+# Main execution
+# =============================================================================
+
+if __name__ == "__main__":
+
+    BASIS_SIZES = [30]
+
+    torder = "2"
+    init_snap = 0.0
+    inte_snap = 0.1
+    inte_xdmf = 0.5
+
+    FinalTime = 300.0
+    dt = 0.1
+
+    rho = 1.225
+    n = 1
+    m = 1.837e-5
+
+    rom_regularization = 1.0e-14
+
+    Ct = Constant(mesh, PETSc.ScalarType(AD_CT))
+    delta = Constant(mesh, PETSc.ScalarType(AD_DELTA))
+    n_ad = Constant(mesh, PETSc.ScalarType(AD_N))
+
+    mpi_print("Actuator disk parameters:")
+    mpi_print(f"  Ct    = {AD_CT}")
+    mpi_print(f"  delta = {AD_DELTA} m")
+    mpi_print(f"  n_ad  = {AD_N}")
+
+    if torder == "1":
+        theta = [1.0, -1.0, 0.0, 0.0]
+
+    elif torder == "2":
+        theta = [3.0 / 2.0, -2.0, 1.0 / 2.0, 0.0]
+
+    elif torder == "2op":
+        theta = [
+            0.48 * 11.0 / 6.0 + 0.52 * 3.0 / 2.0,
+            0.48 * -3.0 + 0.52 * -2.0,
+            0.48 * 3.0 / 2.0 + 0.52 * 1.0 / 2.0,
+            0.48 * -1.0 / 3.0,
+        ]
+
+    elif torder == "3":
+        theta = [11.0 / 6.0, -3.0, 3.0 / 2.0, -1.0 / 3.0]
+
+    else:
+        raise ValueError(f"Unknown time-integration order: {torder}")
+
+    tolSteady = 1.0e-10
+    tol_NL = 1.0e-3
+    maxiter_NL = 60
+    alpha_U = 0.7
+
+    C1 = 8.0
+    C2 = 2.0
+    C3 = 1.0
+    C4 = 1.0
+
+    int_sgs = [3.0 / 2.0, -2.0, 1.0 / 2.0, 0.0]
+
+    u_in = InletVelocity(
+        UREF=UREF_INLET,
+        ZREF=ZREF_INLET,
+        ALPHA=ALPHA_INLET,
+        Y_ORIGIN=Y_ORIGIN_INLET,
+        Z_MIN=Z_MIN_INLET,
+    )
+
+    W, V, Q, map_u, map_p, bcs_u, VisSpace, u_inlet = build_space(mesh, u_in)
+
+    if rank == 0:
+        RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    comm.Barrier()
+
+    RESULTS_DIR = RUNS_ROOT
+    plot_inlet_velocity_profile()
+
+    if rank == 0:
+        print("\n============================================================")
+        print("ROM basis sweep")
+        print("============================================================")
+        print(f"Basis sizes: {BASIS_SIZES}")
+        print(f"Final time : {FinalTime} s")
+        print(f"dt         : {dt} s")
+        print(f"Outputs    : {RUNS_ROOT}")
+        print("============================================================\n")
+
+    for r_requested in BASIS_SIZES:
+        rsize = int(r_requested)
+
+        RESULTS_DIR = RUNS_ROOT / f"r_{rsize:03d}"
+        RESULTS_BP = RESULTS_DIR / "rom_terrain_turbine.bp"
+
+        comm.Barrier()
+
+        mpi_print("\n" + "=" * 72)
+        mpi_print(f"Starting ROM run with r = {rsize}")
+        mpi_print(f"Final time = {FinalTime} s")
+        mpi_print(f"Output directory = {RESULTS_DIR}")
+        mpi_print("=" * 72)
+
+        solve_rom(
+            W,
+            V,
+            Q,
+            map_u,
+            map_p,
+            bcs_u,
+            FinalTime,
+            dt,
+            theta,
+            mesh,
+            VisSpace,
+            u_inlet,
+            u_in,
+        )
+
+        comm.Barrier()
+
+        mpi_print("=" * 72)
+        mpi_print(f"Finished ROM run with r = {rsize}")
+        mpi_print(f"Results saved in: {RESULTS_DIR}")
+        mpi_print("=" * 72 + "\n")
+
+    end_time = datetime.now()
+    mpi_print(f"Total duration: {end_time - start_time}")

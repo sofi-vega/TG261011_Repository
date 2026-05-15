@@ -1,0 +1,1020 @@
+from datetime import datetime
+from pathlib import Path
+import shutil
+
+import numpy as np
+import ufl
+import adios4dolfinx
+
+from mpi4py import MPI
+from petsc4py import PETSc
+
+from basix.ufl import element, mixed_element
+from dolfinx import fem
+from dolfinx.fem import (
+    Constant,
+    Function,
+    functionspace,
+    locate_dofs_topological,
+    dirichletbc,
+)
+from dolfinx.fem import petsc as fem_petsc
+from dolfinx.io import XDMFFile
+from dolfinx.mesh import locate_entities_boundary
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+start_time = datetime.now()
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
+
+# =============================================================================
+# Output paths
+# =============================================================================
+
+RESULTS_DIR = Path("results.AD")
+SNAPSHOT_DIR = RESULTS_DIR / "snapshots")
+SNAPSHOT_BP = SNAPSHOT_DIR / "fom.bp"
+
+MESH_DIR = Path("mesh")
+MESH_BP = MESH_DIR / "mesh.bp"
+
+if rank == 0:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+comm.Barrier()
+
+
+# =============================================================================
+# Case parameters
+# =============================================================================
+
+UREF_INLET = 7.196
+ZREF_INLET = 100.0
+ALPHA_INLET = 0.13
+Y_ORIGIN_INLET = 5.0
+Z_MIN_INLET = 1.0
+
+FLUID_MARKER = 1
+DISK_MARKER = 2
+
+INLET_MARKER = 2
+OUTLET_MARKER = 3
+WALL_MARKER = 4
+
+
+# =============================================================================
+# Mesh and tags
+# =============================================================================
+
+mesh = adios4dolfinx.read_mesh(MESH_BP, comm, engine="BP4")
+
+ct = adios4dolfinx.read_meshtags(
+    MESH_BP,
+    mesh,
+    meshtag_name="cell_tags",
+    engine="BP4",
+)
+ct.name = "cell_tags"
+
+ft = adios4dolfinx.read_meshtags(
+    MESH_BP,
+    mesh,
+    meshtag_name="facet_tags",
+    engine="BP4",
+)
+ft.name = "facet_tags"
+
+tdim = mesh.topology.dim
+fdim = tdim - 1
+gdim = mesh.geometry.dim
+
+mesh.topology.create_entities(fdim)
+mesh.topology.create_connectivity(fdim, tdim)
+mesh.topology.create_connectivity(tdim, fdim)
+
+dx = ufl.Measure("dx", domain=mesh)
+ds = ufl.Measure("ds", domain=mesh, subdomain_data=ft)
+
+
+# =============================================================================
+# Actuator-disk indicator
+# =============================================================================
+
+V0 = functionspace(mesh, ("DG", 0))
+
+chi_ad = Function(V0)
+chi_ad.name = "chi_actuator_disk"
+chi_ad.x.array[:] = 0.0
+
+disk_cells = ct.find(DISK_MARKER)
+
+for cell in disk_cells:
+    dofs = V0.dofmap.cell_dofs(cell)
+    chi_ad.x.array[dofs] = PETSc.ScalarType(1.0)
+
+chi_ad.x.scatter_forward()
+
+n_disk_local = len(disk_cells)
+n_disk_global = comm.allreduce(n_disk_local, op=MPI.SUM)
+
+if rank == 0:
+    print("Actuator disk indicator created.")
+    print(f"  disk marker = {DISK_MARKER}")
+    print(f"  local/global disk cells = {n_disk_local}/{n_disk_global}")
+
+    if n_disk_global == 0:
+        print(
+            "WARNING: No cells were found for the actuator-disk marker. "
+            "Check that cell_tags were exported correctly."
+        )
+
+chi_file = XDMFFile(comm, RESULTS_DIR / "actuator_disk_indicator.xdmf", "w")
+chi_file.write_mesh(mesh)
+chi_file.write_function(chi_ad, 0.0)
+chi_file.close()
+
+
+# =============================================================================
+# Inlet height detection
+# =============================================================================
+
+x_coords = mesh.geometry.x[:, 0]
+y_coords = mesh.geometry.x[:, 1]
+
+x_min = np.min(x_coords)
+tol = 1.0e-8
+
+mask_inlet = np.isclose(x_coords, x_min, atol=tol)
+
+y_min_inlet = np.min(y_coords[mask_inlet])
+y_max_inlet = np.max(y_coords[mask_inlet])
+
+if rank == 0:
+    print(f"Minimum inlet height: {y_min_inlet}")
+    print(f"Maximum inlet height: {y_max_inlet}")
+    print(f"Total inlet height:   {y_max_inlet - y_min_inlet}")
+
+
+# =============================================================================
+# Boundary conditions
+# =============================================================================
+
+class InletVelocity:
+    """Power-law atmospheric boundary-layer inlet profile."""
+
+    def __init__(
+        self,
+        UREF=7.196,
+        ZREF=100.0,
+        ALPHA=0.13,
+        Y_ORIGIN=5.0,
+        Z_MIN=1.0,
+    ):
+        self.UREF = UREF
+        self.ZREF = ZREF
+        self.ALPHA = ALPHA
+        self.Y_ORIGIN = Y_ORIGIN
+        self.Z_MIN = Z_MIN
+
+    def __call__(self, x):
+        values = np.zeros((gdim, x.shape[1]), dtype=PETSc.ScalarType)
+
+        y = x[1]
+        z_real = y - self.Y_ORIGIN
+        z_eff = np.maximum(z_real, self.Z_MIN)
+
+        values[0] = self.UREF * (z_eff / self.ZREF) ** self.ALPHA
+        values[1] = 0.0
+
+        return values
+
+
+u_in = InletVelocity(
+    UREF=UREF_INLET,
+    ZREF=ZREF_INLET,
+    ALPHA=ALPHA_INLET,
+    Y_ORIGIN=Y_ORIGIN_INLET,
+    Z_MIN=Z_MIN_INLET,
+)
+
+
+def plot_inlet_velocity_profile():
+    """Save the inlet velocity profile used by the simulation."""
+
+    if rank != 0:
+        return
+
+    y_plot = np.linspace(y_min_inlet, y_max_inlet, 300)
+
+    z_real = y_plot - Y_ORIGIN_INLET
+    z_eff = np.maximum(z_real, Z_MIN_INLET)
+
+    u_plot = UREF_INLET * (z_eff / ZREF_INLET) ** ALPHA_INLET
+
+    plt.figure(figsize=(6, 7))
+    plt.plot(u_plot, y_plot, linewidth=2)
+
+    plt.xlabel("Inlet velocity $u_x$ [m/s]")
+    plt.ylabel("Vertical coordinate $y$ [m]")
+    plt.title("Inlet velocity profile")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "inlet_velocity_profile.png", dpi=300)
+    plt.close()
+
+    print(f"Inlet velocity profile saved to: {RESULTS_DIR / 'inlet_velocity_profile.png'}")
+
+
+plot_inlet_velocity_profile()
+
+
+# =============================================================================
+# Function spaces and boundary conditions
+# =============================================================================
+
+def build_space(mesh, u_in):
+    """Build the mixed velocity-pressure space and impose Dirichlet conditions."""
+
+    global poly
+    poly = 1
+
+    Pu = element("Lagrange", mesh.basix_cell(), poly, shape=(gdim,))
+    Pp = element("Lagrange", mesh.basix_cell(), poly)
+
+    TH = mixed_element([Pu, Pp])
+    W = functionspace(mesh, TH)
+
+    V, map_u = W.sub(0).collapse()
+    Q, map_p = W.sub(1).collapse()
+
+    VisSpace = functionspace(mesh, Pp)
+
+    u_inlet = Function(V)
+    u_inlet.interpolate(u_in)
+    u_inlet.x.scatter_forward()
+
+    u_zero = Function(V)
+    u_zero.x.array[:] = 0.0
+    u_zero.x.scatter_forward()
+
+    p_outlet = Function(Q)
+    p_outlet.x.array[:] = 0.0
+    p_outlet.x.scatter_forward()
+
+    y_local_max = np.max(mesh.geometry.x[:, 1])
+    y_top = comm.allreduce(y_local_max, op=MPI.MAX)
+
+    y_local_min = np.min(mesh.geometry.x[:, 1])
+    y_min = comm.allreduce(y_local_min, op=MPI.MIN)
+
+    tol_top = 1.0e-8 * max(1.0, abs(y_top - y_min))
+
+    top_facets_all = locate_entities_boundary(
+        mesh,
+        fdim,
+        lambda x: np.isclose(x[1], y_top, atol=tol_top),
+    )
+
+    wall_facets_all = ft.find(WALL_MARKER)
+    top_wall_facets = np.intersect1d(wall_facets_all, top_facets_all)
+    wall_facets_no_top = np.setdiff1d(wall_facets_all, top_wall_facets)
+
+    n_wall_total = comm.allreduce(len(wall_facets_all), op=MPI.SUM)
+    n_top = comm.allreduce(len(top_wall_facets), op=MPI.SUM)
+    n_wall_no_top = comm.allreduce(len(wall_facets_no_top), op=MPI.SUM)
+
+    if rank == 0:
+        print("Open top boundary configuration:")
+        print(f"  y_top = {y_top}")
+        print(f"  total wall facets = {n_wall_total}")
+        print(f"  top facets removed from no-slip = {n_top}")
+        print(f"  no-slip wall facets = {n_wall_no_top}")
+        print("  no Dirichlet condition is imposed on the top boundary")
+
+    dofs_walls = locate_dofs_topological(
+        (W.sub(0), V),
+        fdim,
+        wall_facets_no_top,
+    )
+    bc_walls = dirichletbc(u_zero, dofs_walls, W.sub(0))
+
+    dofs_in = locate_dofs_topological(
+        (W.sub(0), V),
+        fdim,
+        ft.find(INLET_MARKER),
+    )
+    bc_in = dirichletbc(u_inlet, dofs_in, W.sub(0))
+
+    dofs_out = locate_dofs_topological(
+        (W.sub(1), Q),
+        fdim,
+        ft.find(OUTLET_MARKER),
+    )
+    bc_out = dirichletbc(p_outlet, dofs_out, W.sub(1))
+
+    bcs_u = [bc_walls, bc_in, bc_out]
+
+    return W, V, Q, map_u, map_p, bcs_u, VisSpace, u_inlet
+
+
+# =============================================================================
+# Variational operators
+# =============================================================================
+
+def epsilon(u):
+    return ufl.sym(ufl.grad(u))
+
+
+def Viscosity(wk, n, m):
+    uk = ufl.as_vector((wk[0], wk[1]))
+
+    gamma = epsilon(uk)
+    gamma_dot = ufl.sqrt(0.5 * ufl.inner(gamma, gamma)) + 1.0e-6
+
+    visc_trial = m * (gamma_dot ** (n - 1))
+
+    low_lim = m / 10000.0
+    high_lim = m * 10000.0
+
+    return ufl.conditional(
+        visc_trial <= low_lim,
+        low_lim,
+        ufl.conditional(visc_trial >= high_lim, high_lim, visc_trial),
+    )
+
+
+def tau(wk, dt, visco):
+    u_k = ufl.as_vector((wk[0], wk[1]))
+
+    normu = ufl.sqrt(ufl.dot(u_k, u_k))
+    h = ufl.JacobianDeterminant(W.mesh) ** (1.0 / gdim)
+
+    freq1 = C1 * visco / (h / poly**2) ** 2
+    freq2 = C2 * rho * normu / (h / poly)
+    freqt = C4 * rho / dt
+
+    freq_total = freq1 + freq2 + freqt
+
+    timom = ufl.conditional(freq_total < 1.0e-4, 1.0e12, 1.0 / freq_total)
+    tidiv = C3 * (h / poly**2) ** 2 / (timom * C1)
+
+    return ufl.as_matrix(
+        (
+            (timom, 0.0, 0.0),
+            (0.0, timom, 0.0),
+            (0.0, 0.0, tidiv),
+        )
+    )
+
+
+def tau_in(tau_mat):
+    return ufl.as_matrix(
+        (
+            (1.0 / tau_mat[0, 0], 0.0, 0.0),
+            (0.0, 1.0 / tau_mat[1, 1], 0.0),
+            (0.0, 0.0, 1.0 / tau_mat[2, 2]),
+        )
+    )
+
+
+def tau_d(wk, dt, visco):
+    Taui = tau_in(tau(wk, dt, visco))
+
+    M1 = (1.0 / dt) * int_sgs[0] + Taui[0, 0]
+    M2 = (1.0 / dt) * int_sgs[0] + Taui[1, 1]
+
+    return ufl.as_matrix(
+        (
+            (1.0 / M1, 0.0, 0.0),
+            (0.0, 1.0 / M2, 0.0),
+            (0.0, 0.0, 1.0 / Taui[2, 2]),
+        )
+    )
+
+
+def Lc(w, wk):
+    u = ufl.as_vector((w[0], w[1]))
+    uk = ufl.as_vector((wk[0], wk[1]))
+
+    Au = rho * (ufl.grad(u) * uk)
+
+    return ufl.as_vector((Au[0], Au[1], 0.0))
+
+
+def Lp(w):
+    p = w[2]
+    Ap = ufl.grad(p)
+
+    return ufl.as_vector((Ap[0], Ap[1], 0.0))
+
+
+def Ldiv(w):
+    u = ufl.as_vector((w[0], w[1]))
+
+    return ufl.as_vector((0.0, 0.0, ufl.div(u)))
+
+
+_proj_cache = {}
+
+
+def project(expr, target_space):
+    """Compute an L2 projection using a cached linear solver."""
+
+    key = id(target_space)
+
+    if key not in _proj_cache:
+        u = ufl.TrialFunction(target_space)
+        v = ufl.TestFunction(target_space)
+        dx_local = ufl.Measure("dx", domain=target_space.mesh)
+
+        a_form = fem.form(ufl.inner(u, v) * dx_local)
+
+        A = fem_petsc.assemble_matrix(a_form)
+        A.assemble()
+
+        ksp = PETSc.KSP().create(target_space.mesh.comm)
+        ksp.setOperators(A)
+        ksp.setType("preonly")
+
+        pc = ksp.getPC()
+        pc.setType("lu")
+
+        ksp.setFromOptions()
+
+        _proj_cache[key] = (A, ksp)
+
+    A, ksp = _proj_cache[key]
+
+    v = ufl.TestFunction(target_space)
+    dx_local = ufl.Measure("dx", domain=target_space.mesh)
+
+    L_form = fem.form(ufl.inner(expr, v) * dx_local)
+
+    b = fem_petsc.assemble_vector(L_form)
+    b.ghostUpdate(
+        addv=PETSc.InsertMode.ADD,
+        mode=PETSc.ScatterMode.REVERSE,
+    )
+
+    uh = fem.Function(target_space)
+    ksp.solve(b, uh.x.petsc_vec)
+    uh.x.scatter_forward()
+
+    return uh
+
+
+def Subscales1(w, wk, dt, visco):
+    """Convective subscale contribution."""
+
+    return tau_d(wk, dt, visco) * (-Lc(w, wk) - project(-Lc(wk, wk), W))
+
+
+def Subscales2(w, wk, dt, visco):
+    """Pressure-gradient subscale contribution."""
+
+    return tau_d(wk, dt, visco) * (-Lp(w) - project(-Lp(wk), W))
+
+
+def Subscales3(w, wk, dt, visco):
+    """Divergence subscale contribution."""
+
+    return tau_d(wk, dt, visco) * (-Ldiv(w) - project(-Ldiv(wk), W))
+
+
+def VarFormNS(
+    w,
+    wk,
+    w_,
+    w_old,
+    w_oold,
+    w_ooold,
+    y_old,
+    y_oold,
+    y_ooold,
+    visco,
+    dt,
+):
+    """VMS-stabilized weak form with actuator-disk momentum sink."""
+
+    u = ufl.as_vector((w[0], w[1]))
+    p = w[2]
+
+    u_k = ufl.as_vector((wk[0], wk[1]))
+
+    v = ufl.as_vector((w_[0], w_[1]))
+    q = w_[2]
+
+    ukn = ufl.dot(u_k, n_ad)
+    ukn_abs = ufl.sqrt(ukn * ukn + PETSc.ScalarType(1.0e-12))
+
+    f_ad = (
+        -chi_ad
+        * 0.5
+        * rho
+        * Ct
+        * ukn_abs
+        * ufl.dot(u, n_ad)
+        / delta
+        * n_ad
+    )
+
+    F_G = (
+        2.0 * visco * ufl.inner(epsilon(u), epsilon(v))
+        + ufl.inner(rho * ufl.dot(ufl.grad(u), u_k), v)
+        - ufl.inner(p, ufl.div(v))
+        + ufl.div(u) * q
+        - ufl.inner(f_ad, v)
+    ) * dx
+
+    F_S1 = ufl.inner(Subscales1(w, wk, dt, visco), -Lc(w_, wk)) * dx
+    F_S2 = ufl.inner(Subscales2(w, wk, dt, visco), -Lp(w_)) * dx
+    F_S3 = ufl.inner(Subscales3(w, wk, dt, visco), -Ldiv(w_)) * dx
+
+    return F_G + F_S1 + F_S2 + F_S3
+
+
+def sigmapost(v, p, visco):
+    return -p * ufl.Identity(len(v)) + visco * (ufl.grad(v) + ufl.grad(v).T)
+
+
+def mpi_print(*args, **kwargs):
+    if rank == 0:
+        print(*args, **kwargs)
+
+
+# =============================================================================
+# Full-order solver
+# =============================================================================
+
+def solve_fom(
+    W,
+    V,
+    Q,
+    map_u,
+    map_p,
+    bcs_u,
+    FinalTime,
+    dt,
+    theta,
+    mesh,
+    VisSpace,
+    u_inlet,
+    u_in,
+):
+    """Run the transient full-order model and store visualization files and snapshots."""
+
+    w = ufl.TrialFunction(W)
+    z = ufl.TestFunction(W)
+
+    y_ = Function(W)
+
+    w_old = Function(W)
+    y_old = Function(W)
+
+    w_oold = Function(W)
+    y_oold = Function(W)
+
+    w_ooold = Function(W)
+    y_ooold = Function(W)
+
+    w_i = Function(W)
+    w_inc = Function(W)
+
+    u_vis = Function(V)
+    u_vis.name = "velocity"
+
+    p_vis = Function(Q)
+    p_vis.name = "pressure"
+
+    p_vis_P1 = Function(Q)
+    p_vis_P1.name = "pressure_P1"
+
+    visco_vis = Function(VisSpace)
+    visco_vis.name = "viscosity"
+
+    ufile = XDMFFile(comm, RESULTS_DIR / "velocity.xdmf", "w")
+    pfile = XDMFFile(comm, RESULTS_DIR / "pressure.xdmf", "w")
+    vfile = XDMFFile(comm, RESULTS_DIR / "viscosity.xdmf", "w")
+    backup = XDMFFile(comm, RESULTS_DIR / "Backup.xdmf", "w")
+
+    for output_file in [ufile, pfile, vfile, backup]:
+        output_file.write_mesh(mesh)
+
+    if rank == 0 and SNAPSHOT_BP.exists():
+        shutil.rmtree(SNAPSHOT_BP)
+
+    comm.Barrier()
+
+    adios4dolfinx.write_mesh(SNAPSHOT_BP, mesh, engine="BP4")
+    adios4dolfinx.write_meshtags(
+        SNAPSHOT_BP,
+        mesh,
+        ft,
+        meshtag_name="facet_tags",
+        engine="BP4",
+    )
+    adios4dolfinx.write_meshtags(
+        SNAPSHOT_BP,
+        mesh,
+        ct,
+        meshtag_name="cell_tags",
+        engine="BP4",
+    )
+
+    for f in [w_i, w_old, w_oold, w_ooold]:
+        f.x.array[:] = 0.0
+        f.x.scatter_forward()
+
+    time = 0.0
+    next_xdmf_time = 0.0
+    next_snap_time = init_snap
+
+    if save_steady_snapshots:
+        mpi_print("Steady extra snapshots: enabled")
+    else:
+        mpi_print("Steady extra snapshots: disabled")
+
+    expected_snapshots = (
+        int(np.floor((FinalTime - init_snap) / inte_snap)) + 1
+        if inte_snap > 0
+        else 0
+    )
+
+    mpi_print(f"Expected BP snapshots: {max(expected_snapshots, 0)}")
+    mpi_print(f"BP interval:     {inte_snap} s")
+    mpi_print(f"XDMF interval:   {inte_xdmf} s")
+    mpi_print(f"Backup interval: {inte_backup} steps")
+    mpi_print(f"Running on {size} MPI rank(s)")
+
+    backup_counter = 0
+    steady_snapshot_counter = 0
+    time_tol = max(1.0e-12, 1.0e-9 * dt)
+
+    visco_init = Constant(mesh, PETSc.ScalarType(m))
+
+    Ftt_init = Constant(mesh, PETSc.ScalarType(theta[1] / dt)) * rho * w_old
+    Fttt_init = Constant(mesh, PETSc.ScalarType(theta[2] / dt)) * rho * w_oold
+    Ftttt_init = Constant(mesh, PETSc.ScalarType(theta[3] / dt)) * rho * w_ooold
+
+    FL_init = VarFormNS(
+        w,
+        w_i,
+        z,
+        w_old,
+        w_oold,
+        w_ooold,
+        y_old,
+        y_oold,
+        y_ooold,
+        visco_init,
+        dt,
+    )
+
+    Ft_init = (1.0 / dt) * theta[0] * rho * w
+
+    Du_init = ufl.dot(
+        ufl.as_vector(
+            (
+                Ft_init[0] + Ftt_init[0] + Fttt_init[0] + Ftttt_init[0],
+                Ft_init[1] + Ftt_init[1] + Fttt_init[1] + Ftttt_init[1],
+                0.0,
+            )
+        ),
+        z,
+    ) * dx
+
+    F_init = FL_init + Du_init
+
+    a_form0 = fem.form(ufl.lhs(F_init))
+    L_form0 = fem.form(ufl.rhs(F_init))
+
+    A = fem_petsc.assemble_matrix(a_form0, bcs=bcs_u)
+    A.assemble()
+
+    b = fem_petsc.assemble_vector(L_form0)
+    b.ghostUpdate(
+        addv=PETSc.InsertMode.ADD,
+        mode=PETSc.ScatterMode.REVERSE,
+    )
+
+    ksp = PETSc.KSP().create(A.comm)
+    ksp.setOperators(A)
+    ksp.setType("preonly")
+
+    pc = ksp.getPC()
+    pc.setType("lu")
+
+    ksp.setTolerances(rtol=1.0e-5, atol=1.0e-7, max_it=500)
+    ksp.setFromOptions()
+
+    while time <= FinalTime + time_tol:
+        mpi_print(f"---- Time instant = {time:g} ----")
+
+        u_inlet.interpolate(u_in)
+        u_inlet.x.scatter_forward()
+
+        Ftt = Constant(mesh, PETSc.ScalarType(theta[1] / dt)) * rho * w_old
+        Fttt = Constant(mesh, PETSc.ScalarType(theta[2] / dt)) * rho * w_oold
+        Ftttt = Constant(mesh, PETSc.ScalarType(theta[3] / dt)) * rho * w_ooold
+
+        L2_error_u = 1.0
+        it = 0
+
+        while L2_error_u > tol_NL and it < maxiter_NL:
+            it += 1
+
+            visco = Constant(mesh, PETSc.ScalarType(m)) if n == 1 else Viscosity(w_i, n, m)
+
+            FL = VarFormNS(
+                w,
+                w_i,
+                z,
+                w_old,
+                w_oold,
+                w_ooold,
+                y_old,
+                y_oold,
+                y_ooold,
+                visco,
+                dt,
+            )
+
+            Ft = (1.0 / dt) * theta[0] * rho * w
+
+            Du = ufl.dot(
+                ufl.as_vector(
+                    (
+                        Ft[0] + Ftt[0] + Fttt[0] + Ftttt[0],
+                        Ft[1] + Ftt[1] + Fttt[1] + Ftttt[1],
+                        0.0,
+                    )
+                ),
+                z,
+            ) * dx
+
+            F = FL + Du
+
+            a_form = fem.form(ufl.lhs(F))
+            L_form = fem.form(ufl.rhs(F))
+
+            A.zeroEntries()
+            fem_petsc.assemble_matrix(A, a_form, bcs=bcs_u)
+            A.assemble()
+
+            with b.localForm() as b_loc:
+                b_loc.set(0)
+
+            fem_petsc.assemble_vector(b, L_form)
+            fem_petsc.apply_lifting(b, [a_form], [bcs_u])
+            b.ghostUpdate(
+                addv=PETSc.InsertMode.ADD,
+                mode=PETSc.ScatterMode.REVERSE,
+            )
+            fem_petsc.set_bc(b, bcs_u)
+
+            ksp.setOperators(A)
+            ksp.solve(b, w_inc.x.petsc_vec)
+            w_inc.x.scatter_forward()
+
+            u_inc_expr, _ = ufl.split(w_inc)
+            u_i_expr, _ = ufl.split(w_i)
+
+            L2_error_local = fem.assemble_scalar(
+                fem.form(
+                    ufl.inner(
+                        u_inc_expr - u_i_expr,
+                        u_inc_expr - u_i_expr,
+                    ) * dx
+                )
+            )
+
+            L2_error_u = comm.allreduce(L2_error_local, op=MPI.SUM)
+
+            mpi_print(f"  it = {it}: L2-error-NL = {L2_error_u:g}")
+
+            w_i.x.array[:] = alpha_U * w_inc.x.array + (1.0 - alpha_U) * w_i.x.array
+            w_i.x.scatter_forward()
+
+            if it == maxiter_NL:
+                mpi_print("  Warning: nonlinear solver did not converge.")
+
+        y_ = project(
+            Subscales1(w_inc, w_old, dt, visco)
+            + Subscales2(w_inc, w_old, dt, visco)
+            + Subscales3(w_inc, w_old, dt, visco),
+            W,
+        )
+
+        y_ooold.x.array[:] = y_oold.x.array
+        y_ooold.x.scatter_forward()
+
+        y_oold.x.array[:] = y_old.x.array
+        y_oold.x.scatter_forward()
+
+        y_old.x.array[:] = y_.x.array
+        y_old.x.scatter_forward()
+
+        w_ooold.x.array[:] = w_oold.x.array
+        w_ooold.x.scatter_forward()
+
+        w_oold.x.array[:] = w_old.x.array
+        w_oold.x.scatter_forward()
+
+        w_old.x.array[:] = w_inc.x.array
+        w_old.x.scatter_forward()
+
+        w_i.x.array[:] = w_inc.x.array
+        w_i.x.scatter_forward()
+
+        u_vis.x.array[:] = w_inc.x.array[map_u]
+        u_vis.x.scatter_forward()
+
+        p_vis_P1.x.array[:] = w_inc.x.array[map_p]
+        p_vis_P1.x.scatter_forward()
+
+        p_vis.interpolate(p_vis_P1)
+        p_vis.x.scatter_forward()
+
+        visco_out = project(Viscosity(w_i, n, m), VisSpace)
+        visco_vis.interpolate(visco_out)
+        visco_vis.x.scatter_forward()
+
+        if inte_xdmf > 0 and time + time_tol >= next_xdmf_time:
+            ufile.write_function(u_vis, time)
+            pfile.write_function(p_vis, time)
+            vfile.write_function(visco_vis, time)
+
+            mpi_print(f"  XDMF saved at t = {time:g}")
+            next_xdmf_time += inte_xdmf
+
+        backup_counter += 1
+
+        if backup_counter >= inte_backup:
+            backup.write_function(u_vis, time)
+            backup.write_function(p_vis, time)
+
+            mpi_print("  Backup saved.")
+            backup_counter = 0
+
+        if inte_snap > 0 and time + time_tol >= next_snap_time:
+            comm.Barrier()
+
+            adios4dolfinx.write_function(
+                SNAPSHOT_BP,
+                u_vis,
+                time=time,
+                name="u",
+                engine="BP4",
+            )
+
+            adios4dolfinx.write_function(
+                SNAPSHOT_BP,
+                p_vis,
+                time=time,
+                name="p",
+                engine="BP4",
+            )
+
+            mpi_print(f"  BP snapshot saved at t = {time:g}")
+            next_snap_time += inte_snap
+
+        if save_steady_snapshots and L2_error_u < tolSteady and it == 1:
+            steady_snapshot_counter += 1
+            comm.Barrier()
+
+            adios4dolfinx.write_function(
+                SNAPSHOT_BP,
+                u_vis,
+                time=time,
+                name="u",
+                engine="BP4",
+            )
+
+            adios4dolfinx.write_function(
+                SNAPSHOT_BP,
+                p_vis,
+                time=time,
+                name="p",
+                engine="BP4",
+            )
+
+            mpi_print(f"  Extra steady snapshot {steady_snapshot_counter}")
+
+            if steady_snapshot_counter == SNAPS:
+                mpi_print(f"  Total extra steady snapshots reached: {steady_snapshot_counter}")
+                break
+
+        time += dt
+
+    backup.close()
+    ufile.close()
+    pfile.close()
+    vfile.close()
+
+
+# =============================================================================
+# Main execution
+# =============================================================================
+
+if __name__ == "__main__":
+
+    torder = "2"
+
+    init_snap = 0.0
+    inte_snap = 0.1
+    inte_xdmf = 0.5
+    save_steady_snapshots = False
+
+    rho = 1.225
+    n = 1
+    m = 1.837e-5
+
+    FinalTime = 550.0
+    dt = 0.1
+
+    inte_backup = 10**5
+    SNAPS = 400
+
+    AD_CT = 0.0
+    AD_DELTA = 12.5
+    AD_N = (1.0, 0.0)
+
+    Ct = Constant(mesh, PETSc.ScalarType(AD_CT))
+    delta = Constant(mesh, PETSc.ScalarType(AD_DELTA))
+    n_ad = Constant(mesh, PETSc.ScalarType(AD_N))
+
+    if rank == 0:
+        print("Actuator disk parameters:")
+        print(f"  Ct    = {AD_CT}")
+        print(f"  delta = {AD_DELTA} m")
+        print(f"  n_ad  = {AD_N}")
+
+    if torder == "1":
+        theta = [1.0, -1.0, 0.0, 0.0]
+
+    elif torder == "2":
+        theta = [3.0 / 2.0, -2.0, 1.0 / 2.0, 0.0]
+
+    elif torder == "2op":
+        theta = [
+            0.48 * 11.0 / 6.0 + 0.52 * 3.0 / 2.0,
+            0.48 * -3.0 + 0.52 * -2.0,
+            0.48 * 3.0 / 2.0 + 0.52 * 1.0 / 2.0,
+            0.48 * -1.0 / 3.0,
+        ]
+
+    elif torder == "3":
+        theta = [11.0 / 6.0, -3.0, 3.0 / 2.0, -1.0 / 3.0]
+
+    else:
+        raise ValueError("torder must be '1', '2', '2op', or '3'.")
+
+    tolSteady = 1.0e-10
+    tol_NL = 1.0e-3
+    maxiter_NL = 60
+    alpha_U = 0.7
+
+    C1 = 8.0
+    C2 = 2.0
+    C3 = 1.0
+    C4 = 1.0
+
+    int_sgs = [0.0, 0.0, 0.0, 0.0]
+
+    u_in = InletVelocity(
+        UREF=UREF_INLET,
+        ZREF=ZREF_INLET,
+        ALPHA=ALPHA_INLET,
+        Y_ORIGIN=Y_ORIGIN_INLET,
+        Z_MIN=Z_MIN_INLET,
+    )
+
+    W, V, Q, map_u, map_p, bcs_u, VisSpace, u_inlet = build_space(mesh, u_in)
+
+    solve_fom(
+        W,
+        V,
+        Q,
+        map_u,
+        map_p,
+        bcs_u,
+        FinalTime,
+        dt,
+        theta,
+        mesh,
+        VisSpace,
+        u_inlet,
+        u_in,
+    )
+
+    end_time = datetime.now()
+    mpi_print(f"Duration: {end_time - start_time}")
